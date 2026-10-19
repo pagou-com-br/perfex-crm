@@ -3,8 +3,8 @@ defined('BASEPATH') or exit('No direct script access allowed');
 
 /*
 Module Name: Pagou Integração Perfex CRM
-Description: Gateway de pagamento www.pagou.com.br, PIX & Boleto para Perfex CRM
-Version: 2.0.0
+Description: Gateway de pagamento www.pagou.com.br: PIX, Boleto e Cartão de Crédito para Perfex CRM
+Version: 2.1.0
 Requires at least: 3.2.0
 Author: Liquida SP
 Author URI: https://liquidasp.com.br/
@@ -28,6 +28,7 @@ function pagou_module_permissions()
     $permissions['capabilities'] = [
         'access_pix_avulso' => 'Acessar PIX Avulso',
         'access_reembolso'  => 'Acessar Reembolso de Pagamentos',
+        'card_reverse'      => 'Estornar cobranças de cartão',
     ];
 
     register_staff_capabilities('pagou_module', $permissions, _l('Pagou Integração'));
@@ -48,6 +49,7 @@ hooks()->add_filter('csrf_exclude_uris', function ($uris) {
 register_activation_hook('pagou', 'pagou_activation_hook');
 register_payment_gateway('pagou_boleto_gateway', 'pagou');
 register_payment_gateway('pagou_pix_gateway', 'pagou');
+register_payment_gateway('pagou_cartao_gateway', 'pagou');
 
 hooks()->add_action('invoice_marked_as_cancelled', 'cancel_pagou_boleto');
 hooks()->add_action('invoice_marked_as_cancelled', 'pagou_cancel_invoice_pix');
@@ -61,7 +63,7 @@ hooks()->add_action('admin_init', function () {
 
     pagou_remember_api_tokens();
 
-    if (staff_can('access_pix_avulso', 'pagou_module') || staff_can('access_reembolso', 'pagou_module')) {
+    if (staff_can('access_pix_avulso', 'pagou_module') || staff_can('access_reembolso', 'pagou_module') || staff_can('card_reverse', 'pagou_module')) {
         $CI->app_menu->add_sidebar_menu_item('pagou-menu', [
             'name' => 'Pagou',
             "icon" => "fa fa-usd",
@@ -83,6 +85,15 @@ hooks()->add_action('admin_init', function () {
                 'name' => 'Reembolso de Pagamentos',
                 'href' => admin_url('pagou/cobrancas_emitidas'),
                 'position' => 10,
+            ]);
+        }
+
+        if (staff_can('access_reembolso', 'pagou_module') || staff_can('card_reverse', 'pagou_module')) {
+            $CI->app_menu->add_sidebar_children_item('pagou-menu', [
+                'slug' => 'pagou-card-charges',
+                'name' => 'Cobranças de Cartão',
+                'href' => admin_url('pagou/card_admin'),
+                'position' => 15,
             ]);
         }
         

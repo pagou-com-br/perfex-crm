@@ -56,6 +56,20 @@ class Payment_status extends App_Controller
             ];
         }
 
+        // Última tentativa com cartão: o checkout mostra a recusa sem precisar recarregar
+        if ($this->db->table_exists(db_prefix() . 'pagou_card_charges')) {
+            $card = $this->db->select('status, failure_reason')
+                ->where('invoice_id', $invoice->id)
+                ->order_by('id', 'DESC')->limit(1)
+                ->get(db_prefix() . 'pagou_card_charges')->row();
+            if ($card) {
+                $response['card'] = [
+                    'status' => (string) $card->status,
+                    'reason' => in_array($card->status, ['failed', 'canceled'], true) ? (string) $card->failure_reason : '',
+                ];
+            }
+        }
+
         echo json_encode($response);
     }
 
