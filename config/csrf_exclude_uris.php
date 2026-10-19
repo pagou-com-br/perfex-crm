@@ -4,6 +4,9 @@
 // A autenticação desses endpoints é feita pela assinatura HMAC da Pagou.
 return [
     'pagou/notification',
+    'pagou/webhook',
     'pagou/pagou_webhook/process',
+    'pagou/pagou_webhook/process/.*',
     'admin/pagou/pagou_webhook/process',
+    'admin/pagou/pagou_webhook/process/.*',
 ];

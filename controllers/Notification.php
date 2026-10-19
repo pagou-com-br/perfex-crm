@@ -88,8 +88,9 @@ class Notification extends App_Controller
         }
 
         if ($api_status !== 4) {
-            $this->logDebug("Cobrança {$pagou_id} não está paga na API. Status: {$api_status}");
-            $this->respond(200, 'Pagamento ainda não confirmado pela API.');
+            // 503 para a Pagou reenviar; a consulta pode estar atrasada em relação ao evento
+            $this->logDebug("Cobrança {$pagou_id} ainda não aparece paga na API. Status: {$api_status}");
+            $this->respond(503, 'Pagamento ainda não confirmado pela API. Reenvie depois.');
             return;
         }
 

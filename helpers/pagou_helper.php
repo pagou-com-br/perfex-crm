@@ -270,6 +270,23 @@ function pagou_gateway_api_token($gateway_id)
  */
 function pagou_configured_api_tokens()
 {
+    $tokens = pagou_current_api_tokens();
+
+    // Chaves anteriores: eventos de cobranças antigas continuam assinados com elas
+    foreach (pagou_known_api_tokens() as $token) {
+        $tokens[] = $token;
+    }
+
+    return array_values(array_unique($tokens));
+}
+
+/**
+ * Chaves atualmente configuradas nos gateways.
+ *
+ * @return string[]
+ */
+function pagou_current_api_tokens()
+{
     $tokens = [];
     foreach (['pagou_pix', 'pagou_boleto'] as $gateway_id) {
         $token = pagou_gateway_api_token($gateway_id);
@@ -279,6 +296,52 @@ function pagou_configured_api_tokens()
     }
 
     return array_values(array_unique($tokens));
+}
+
+/**
+ * Chaves já usadas pelos gateways, guardadas criptografadas na opção pagou_known_api_tokens.
+ *
+ * @return string[]
+ */
+function pagou_known_api_tokens()
+{
+    $stored = get_option('pagou_known_api_tokens');
+    if (empty($stored)) {
+        return [];
+    }
+    $CI = &get_instance();
+    $CI->load->library('encryption');
+    $decoded = json_decode((string) $CI->encryption->decrypt($stored), true);
+
+    return is_array($decoded) ? array_values(array_filter($decoded, 'is_string')) : [];
+}
+
+/**
+ * Acrescenta as chaves atuais ao histórico (no máximo 10), para que a troca de chave
+ * não invalide os webhooks das cobranças emitidas antes dela.
+ *
+ * @return void
+ */
+function pagou_remember_api_tokens()
+{
+    $known = pagou_known_api_tokens();
+    $current = pagou_current_api_tokens();
+    $missing = array_diff($current, $known);
+    if (empty($missing)) {
+        return;
+    }
+
+    $merged = array_slice(array_values(array_unique(array_merge($current, $known))), 0, 10);
+    $CI = &get_instance();
+    $CI->load->library('encryption');
+    $value = $CI->encryption->encrypt(json_encode($merged));
+
+    $exists = $CI->db->where('name', 'pagou_known_api_tokens')->count_all_results(db_prefix() . 'options') > 0;
+    if ($exists) {
+        update_option('pagou_known_api_tokens', $value);
+    } else {
+        add_option('pagou_known_api_tokens', $value, 0);
+    }
 }
 
 /**
@@ -384,4 +447,106 @@ function pagou_normalize_status($status, $payment_type = 'pix')
     ];
 
     return $aliases[$status] ?? $status;
+}
+
+/**
+ * Fatura aberta para cobrança: 1 não paga, 3 parcialmente paga, 4 vencida.
+ *
+ * @param object $invoice
+ * @return bool
+ */
+function pagou_invoice_is_open($invoice)
+{
+    return $invoice && in_array((int) $invoice->status, [1, 3, 4], true);
+}
+
+/**
+ * Indica se a consulta GET /v1/charges/{id} mostra o boleto pago,
+ * pelo boleto (4, 8, 9) ou pelo Pix vinculado (qrcode_status 4).
+ *
+ * @param object $charge
+ * @return bool
+ */
+function pagou_boleto_api_is_paid($charge)
+{
+    if (!is_object($charge)) {
+        return false;
+    }
+    if (isset($charge->status) && in_array((int) $charge->status, [4, 8, 9], true)) {
+        return true;
+    }
+
+    return isset($charge->payload->qrcode_status) && (int) $charge->payload->qrcode_status === 4;
+}
+
+/**
+ * Garante as colunas adicionadas na 1.2.1 (também criadas pela migration 121).
+ *
+ * @return void
+ */
+function pagou_ensure_schema_121()
+{
+    static $done = false;
+    if ($done) {
+        return;
+    }
+    $CI = &get_instance();
+    $table = db_prefix() . 'pagou_transactions_pix';
+    if ($CI->db->table_exists($table) && !$CI->db->field_exists('boleto_transaction_id', $table)) {
+        $CI->db->query("ALTER TABLE `{$table}` ADD COLUMN `boleto_transaction_id` varchar(255) DEFAULT NULL");
+    }
+    $done = true;
+}
+
+/**
+ * Grava o Pix vinculado a um boleto numa linha própria de pagou_transactions_pix,
+ * identificada pelo qrcode_id e ligada ao boleto por boleto_transaction_id.
+ * Não altera o Pix avulso da fatura nem regride uma linha já paga ou estornada.
+ *
+ * @param int    $invoice_id
+ * @param object $boleto_data Resposta de criação ou consulta do boleto
+ * @return bool
+ */
+function pagou_save_linked_pix($invoice_id, $boleto_data)
+{
+    if (!isset($boleto_data->id, $boleto_data->payload->qrcode_id) || empty($boleto_data->payload->data)) {
+        return false;
+    }
+
+    pagou_ensure_schema_121();
+    $CI = &get_instance();
+    $table = db_prefix() . 'pagou_transactions_pix';
+
+    $existing = $CI->db->where('transaction_id', $boleto_data->payload->qrcode_id)->get($table)->row();
+    $qr_status = isset($boleto_data->payload->qrcode_status)
+        ? pagou_normalize_status($boleto_data->payload->qrcode_status, 'pix')
+        : 'pending';
+
+    $pix_data = [
+        'invoice_id'            => $invoice_id,
+        'transaction_id'        => $boleto_data->payload->qrcode_id,
+        'boleto_transaction_id' => $boleto_data->id,
+        'cliente'               => $boleto_data->payer->name ?? '',
+        'doc'                   => $boleto_data->payer->document ?? '',
+        'payment_method'        => 'pix',
+        'qr_code'               => $boleto_data->payload->image ?? '',
+        'qr_code_text'          => $boleto_data->payload->data ?? '',
+        'amount'                => $boleto_data->amount ?? 0,
+        'amount_final'          => $boleto_data->amount ?? 0,
+        'api_response'          => json_encode($boleto_data),
+    ];
+
+    if ($existing) {
+        if (!in_array($existing->status, ['paid', 'refund_requested', 'refunded'], true)) {
+            $pix_data['status'] = $qr_status;
+        }
+        $CI->db->where('id', $existing->id)->update($table, $pix_data);
+    } else {
+        $pix_data['status'] = $qr_status;
+        $pix_data['date_created'] = date('Y-m-d H:i:s');
+        $pix_data['expiration_seconds'] = 86400;
+        $CI->db->insert($table, $pix_data);
+    }
+
+    return true;
 }

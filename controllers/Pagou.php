@@ -252,8 +252,8 @@ class Pagou extends AdminController
         // Determina o identificador do QR Code / transaction_id
         $transaction_id_to_use = $transaction->transaction_id;
 
-        if ($transaction->status === 'refund_requested') {
-            echo json_encode(['status' => 'error', 'message' => 'Já existe uma solicitação de estorno para esta cobrança. Aguarde a confirmação da Pagou.']);
+        if (!empty($transaction->boleto_transaction_id)) {
+            echo json_encode(['status' => 'error', 'message' => 'Este Pix pertence a um boleto e não pode ser estornado por aqui.']);
             return;
         }
 
@@ -286,14 +286,28 @@ class Pagou extends AdminController
             echo json_encode(['status' => 'error', 'message' => 'Não foi possível consultar a cobrança na Pagou. Tente novamente em instantes.']);
             return;
         }
-        if ((int) ($current['body']['status'] ?? 0) !== 4) {
+        // refund.status: 1 registro vazio, 2 pendente, 3 confirmada
+        $refund = $current['body']['refund'] ?? null;
+        $refund_status = is_array($refund) ? (int) ($refund['status'] ?? 0) : 0;
+        $charge_status = (int) ($current['body']['status'] ?? 0);
+
+        if ($refund_status === 3 || $charge_status === 5) {
+            $this->pagou_model->update_transaction_pix_status($transaction_id_to_use, 'refunded', []);
+            echo json_encode(['status' => 'warning', 'message' => 'A Pagou já registra a devolução desta cobrança. O status local foi atualizado.']);
+            return;
+        }
+        if ($refund_status === 2) {
+            $this->pagou_model->update_transaction_pix_status($transaction_id_to_use, 'refund_requested', []);
+            echo json_encode(['status' => 'warning', 'message' => 'Já existe uma devolução pendente na Pagou para esta cobrança. Aguarde a confirmação.']);
+            return;
+        }
+        if ($charge_status !== 4) {
             echo json_encode(['status' => 'error', 'message' => 'A cobrança não está paga na Pagou e não pode ser estornada.']);
             return;
         }
-        if (!empty($current['body']['refund'])) {
-            $this->pagou_model->update_transaction_pix_status($transaction_id_to_use, 'refund_requested', []);
-            echo json_encode(['status' => 'error', 'message' => 'Já existe uma solicitação de estorno registrada na Pagou para esta cobrança.']);
-            return;
+        if ($transaction->status === 'refund_requested') {
+            // Sem devolução registrada na Pagou: a solicitação anterior não foi efetivada
+            $this->pagou_model->update_transaction_pix_status($transaction_id_to_use, 'paid', []);
         }
 
         $payload_refund = [
@@ -670,7 +684,7 @@ class Pagou extends AdminController
             
             // Botão de ação
             $action_html = '';
-            if (($status_db === 'paid' || $status_db === '4') && ($payment_method === 'pix')) {
+            if (in_array($status_db, ['paid', '4', 'refund_requested'], true) && ($payment_method === 'pix') && empty($transaction->boleto_transaction_id)) {
                 $action_html = '<div class="btn-group">
                     <button class="btn btn-success btn-sm" onclick="refundTransaction(\'' . 
                     $transaction->transaction_id . '\', \'' . 

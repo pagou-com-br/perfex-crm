@@ -90,7 +90,8 @@ $pix_table_structure = [
     'external_id' => 'varchar(255) DEFAULT NULL',
     'expiration_seconds' => 'int(11) DEFAULT 86400',
     'api_request' => 'text DEFAULT NULL',
-    'api_response' => 'text DEFAULT NULL'
+    'api_response' => 'text DEFAULT NULL',
+    'boleto_transaction_id' => 'varchar(255) DEFAULT NULL'
 ];
 
 // Criação ou atualização da tabela PIX

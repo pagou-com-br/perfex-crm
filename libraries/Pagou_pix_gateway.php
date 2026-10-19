@@ -213,7 +213,7 @@ class Pagou_pix_gateway extends App_gateway
 
 
         $this->ci->db->where('invoice_id', $invoice->id);
-        $this->ci->db->where_in('status', ['paid', 'confirmed']);
+        $this->ci->db->where_in('status', ['paid', 'confirmed', 'refund_requested']);
         $paid_transaction = $this->ci->db->get(db_prefix() . 'pagou_transactions_pix')->row();
 
         if ($paid_transaction) {
@@ -232,8 +232,12 @@ class Pagou_pix_gateway extends App_gateway
             return;
         }
 
+        // Reaproveita só o Pix próprio da fatura (o Pix vinculado ao boleto tem linha separada)
+        pagou_ensure_schema_121();
         $this->ci->db->where('invoice_id', $invoice->id);
-        $this->ci->db->where_not_in('status', ['paid', 'confirmed', 'expired', 'refunded', 'cancelled']);
+        $this->ci->db->where('boleto_transaction_id IS NULL', null, false);
+        $this->ci->db->where_not_in('status', ['paid', 'confirmed', 'expired', 'refund_requested', 'refunded', 'cancelled', 'removed']);
+        $this->ci->db->order_by('id', 'DESC');
         $active_transaction = $this->ci->db->get(db_prefix() . 'pagou_transactions_pix')->row();
 
         if ($active_transaction) {

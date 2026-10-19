@@ -41,8 +41,6 @@ class Pagou_webhook extends CI_Controller {
         
         $this->log('debug', 'Pagou_webhook v3.2 inicializado. CSRF desativado: ' . ($this->config->item('csrf_protection') ? 'Não' : 'Sim'));
         
-        // Verificar e criar tabelas/campos necessários
-        $this->check_required_fields();
     }
     
     /**
@@ -147,6 +145,9 @@ class Pagou_webhook extends CI_Controller {
                 return;
             }
 
+            $this->check_required_fields();
+            pagou_ensure_schema_121();
+
             $data = json_decode($raw_data, true);
             if (!is_array($data)) {
                 $this->log('error', 'Erro ao decodificar JSON: ' . json_last_error_msg());
@@ -229,24 +230,34 @@ class Pagou_webhook extends CI_Controller {
             return $this->processRefundEvent($transaction, $pagou_transaction_id, $amount_from_webhook, $data);
         }
 
-        // Evento de pagamento atrasado não reabre uma cobrança já estornada
-        if ($transaction->status === 'refunded') {
+        // Evento de pagamento atrasado não reabre uma cobrança estornada ou em estorno
+        if (in_array($transaction->status, ['refund_requested', 'refunded'], true)) {
             $this->log('info', "Cobrança {$pagou_transaction_id} já estornada. Evento de pagamento ignorado.");
             return ['code' => 200, 'message' => 'Cobrança já estornada. Evento ignorado.'];
         }
 
+        // Pix vinculado a boleto: o pedido comercial é o boleto
+        $linked_boleto_id = ($payment_type === 'pix' && !empty($transaction->boleto_transaction_id))
+            ? $transaction->boleto_transaction_id
+            : null;
+        $confirm_type = $linked_boleto_id ? 'boleto' : $payment_type;
+        $commercial_id = $linked_boleto_id ?: $pagou_transaction_id;
+
         // Confirma na API antes de dar baixa
-        $api_data = $this->getPagouTransactionData($pagou_transaction_id, $payment_type);
+        $api_data = $this->getPagouTransactionData($commercial_id, $confirm_type);
         if (!$api_data) {
             return ['code' => 503, 'message' => 'Não foi possível confirmar o pagamento na API. Reenvie depois.'];
         }
 
-        $api_status = isset($api_data->status) ? (int) $api_data->status : null;
-        $paid_statuses = ($payment_type === 'pix') ? [4] : [4, 8, 9];
-        if (!in_array($api_status, $paid_statuses, true)) {
-            $this->log('warning', 'Pagamento não confirmado pela API. Status: ' . var_export($api_status, true));
-            $this->updateTransaction($transaction, $api_status, null, null, null, $data, $payment_type);
-            return ['code' => 200, 'message' => 'Pagamento ainda não confirmado pela API.'];
+        $api_status = isset($api_data->status) && is_numeric($api_data->status) ? (int) $api_data->status : null;
+        $is_paid = ($confirm_type === 'boleto') ? pagou_boleto_api_is_paid($api_data) : ($api_status === 4);
+        if (!$is_paid) {
+            $this->log('warning', 'Pagamento ainda não refletido na API. Status: ' . var_export($api_status, true));
+            if ($api_status !== null && !$linked_boleto_id) {
+                $this->updateTransaction($transaction, $api_status, null, null, null, $data, $payment_type);
+            }
+            // 503 para a Pagou reenviar; a consulta pode estar atrasada em relação ao evento
+            return ['code' => 503, 'message' => 'Pagamento ainda não confirmado pela API. Reenvie depois.'];
         }
 
         $paid_at = $api_data->paid_at ?? $event_paid_at ?? date('Y-m-d H:i:s');
@@ -259,14 +270,15 @@ class Pagou_webhook extends CI_Controller {
             return ['code' => 500, 'message' => 'Erro ao atualizar transação.'];
         }
 
+        // Um único registro de pagamento por pedido comercial (boleto ou Pix)
         $payment_processed = $this->processPayment(
             $transaction,
-            $pagou_transaction_id,
+            $commercial_id,
             'paid',
             $paid_at,
             $amount_from_webhook,
             $payer_info,
-            $payment_type
+            $confirm_type
         );
 
         if (!$payment_processed) {
@@ -582,29 +594,40 @@ private function updateTransaction($transaction, $new_status, $paid_at = null, $
                 return false;
             }
 
-            // Verifica se o pagamento já existe
-            $already_exists = $this->checkPaymentExists($transaction->invoice_id, $pagou_transaction_id);
-            if ($already_exists) {
+            // Trava a fatura para que reenvios simultâneos não gerem dois pagamentos
+            $this->db->trans_begin();
+            $this->db->query('SELECT id FROM ' . db_prefix() . 'invoices WHERE id = ? FOR UPDATE', [$transaction->invoice_id]);
+
+            if ($this->checkPaymentExists($transaction->invoice_id, $pagou_transaction_id)) {
+                $this->db->trans_commit();
                 $this->log('info', "Pagamento já registrado anteriormente");
                 $this->safeUpdateInvoiceStatus($transaction->invoice_id);
                 return true;
             }
-            
+
             // Se o valor é inválido, use o valor da fatura
             if ($amount_final === null || $amount_final <= 0) {
                 $amount_final = $invoice->total;
                 $this->log('debug', "Valor não fornecido ou inválido, usando total da fatura: {$amount_final}");
             }
-            
-            // Registra o pagamento
-            return $this->registerPayment($transaction->invoice_id, $pagou_transaction_id, $new_status, $paid_at, $amount_final, $payer_info, $payment_type);
-            
+
+            $registered = $this->registerPayment($transaction->invoice_id, $pagou_transaction_id, $new_status, $paid_at, $amount_final, $payer_info, $payment_type);
+
+            if ($registered && $this->db->trans_status() !== false) {
+                $this->db->trans_commit();
+                return true;
+            }
+
+            $this->db->trans_rollback();
+            return false;
+
         } catch (\Throwable $e) {
+            $this->db->trans_rollback();
             $this->log('error', "Erro no processamento: " . $e->getMessage());
             return false;
         }
     }
-    
+
     /**
      * Verifica se um pagamento já existe
      * 

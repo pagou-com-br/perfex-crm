@@ -729,6 +729,8 @@ function viewTransactionDetails(transactionId) {
                     statusHtml = '<span class="label label-success"><i class="fa fa-check-circle"></i> Pago</span>';
                 } else if (status === 'pending' || status === '1') {
                     statusHtml = '<span class="label label-warning"><i class="fa fa-clock-o"></i> Pendente</span>';
+                } else if (status === 'refund_requested') {
+                    statusHtml = '<span class=\"label label-info\">Estorno solicitado</span>';
                 } else if (status === 'refunded') {
                     statusHtml = '<span class="label label-danger"><i class="fa fa-undo"></i> Reembolsado</span>';
                 } else {

@@ -3,6 +3,9 @@ defined('BASEPATH') or exit('No direct script access allowed');
 
 $route['pagou/notification'] = 'notification/index';
 
+// notification_url antiga (Checkout legado): mesmo webhook autenticado
+$route['pagou/webhook'] = 'pagou_webhook/process';
+
 // Payment check route
 $route['pagou/check_payment/(:any)'] = 'pagou/check_payment/$1';
 

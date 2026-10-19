@@ -249,49 +249,63 @@ class Pagou_boleto_gateway extends App_gateway
         }
 
         $invoice = $data['invoice'];
+        $auto = !empty($data['auto_generated']);
         $this->log('debug', 'Processando pagamento para a Fatura Perfex ID: ' . $invoice->id . ', Número: ' . format_invoice_number($invoice->id));
+
+        // Só emite boleto para fatura não paga, parcialmente paga ou vencida
+        if (!pagou_invoice_is_open($invoice)) {
+            $this->log('info', 'Fatura ID ' . $invoice->id . ' não está aberta (status ' . $invoice->status . '). Boleto não emitido.');
+            return $this->fail_payment($invoice, $auto, 'Esta fatura não está aberta para pagamento.');
+        }
 
         // Verifica a existência da tabela no banco de dados
         $this->ensure_table_exists();
 
-        // Verifica boleto existente não pago/expirado
+        // Verifica boleto existente ainda utilizável
         $this->ci->db->where('invoice_id', $invoice->id);
-        $this->ci->db->where_not_in('status', ['paid', 'confirmed', 'expired', 'refunded', 'cancelled']); // Status que indicam finalização ou cancelamento
+        $this->ci->db->where_not_in('status', ['paid', 'confirmed', 'expired', 'refunded', 'cancelled', 'rejected', 'removed']);
+        $this->ci->db->order_by('id', 'DESC');
         $existing_transaction = $this->ci->db->get(db_prefix() . 'pagou_transactions_boleto')->row();
 
         if ($existing_transaction) {
-            // Verifica se o boleto está expirado baseado na data de vencimento
-            $due_date = new DateTime($existing_transaction->due_date);
-            $now = new DateTime();
-            
-            if ($due_date < $now) {
-                $this->log('info', "Transação existente (ID Pagou: {$existing_transaction->transaction_id}) para a Fatura ID: " . $invoice->id . " está vencida. Criando novo boleto.");
-                // Atualiza status da transação para expirada
-                $this->ci->db->where('id', $existing_transaction->id);
-                $this->ci->db->update(db_prefix() . 'pagou_transactions_boleto', ['status' => 'expired']);
-                // Continua o fluxo para gerar um novo boleto
-            } else {
-                $this->log('info', "Transação existente (ID Pagou: {$existing_transaction->transaction_id}) encontrada para a Fatura ID: " . $invoice->id . ". Reutilizando boleto.");
-                
-                // NOVO: Consulta o boleto para obter informações atualizadas
-                $updated_data = $this->fetch_boleto_data($existing_transaction->transaction_id);
-                
-                if ($updated_data && isset($updated_data->status)) {
-                    // Atualiza os dados locais com base na consulta
-                    $this->update_boleto_from_api($existing_transaction, $updated_data);
-                    
-                    // Se há dados de PIX, atualiza ou insere na tabela de PIX
-                    if (isset($updated_data->payload) && isset($updated_data->payload->qrcode_id)) {
-                        $this->save_pix_data_from_boleto($invoice->id, $updated_data);
-                    }
-                }
-                
-                // Carrega a view independente de ter conseguido atualizar ou não
-                return $this->load_boleto_view($invoice, $existing_transaction);
+            $updated_data = $this->fetch_boleto_data($existing_transaction->transaction_id);
+            if ($updated_data && isset($updated_data->status)) {
+                $this->update_boleto_from_api($existing_transaction, $updated_data);
+                pagou_save_linked_pix($invoice->id, $updated_data);
             }
+
+            $api_status = ($updated_data && isset($updated_data->status)) ? pagou_normalize_status($updated_data->status, 'boleto') : null;
+            $is_dead = in_array($api_status, ['cancelled', 'rejected', 'refunded'], true);
+
+            // Pago (inclusive pelo Pix vinculado) ou ainda dentro do prazo: reaproveita
+            if (($updated_data && pagou_boleto_api_is_paid($updated_data)) || (!$is_dead && !$this->boleto_is_expired($existing_transaction))) {
+                $this->log('info', "Reutilizando boleto {$existing_transaction->transaction_id} da Fatura ID {$invoice->id}.");
+                if ($auto) {
+                    return ['success' => true, 'transaction_id' => $existing_transaction->transaction_id];
+                }
+                return $this->load_boleto_view($invoice, $existing_transaction->id);
+            }
+
+            if (!$updated_data) {
+                // Sem confirmar o estado do boleto anterior, não emite outro
+                return $this->fail_payment($invoice, $auto, 'Não foi possível consultar o boleto anterior. Tente novamente em instantes.');
+            }
+
+            if (!$is_dead && !$this->cancel_boleto_api($existing_transaction->transaction_id)) {
+                return $this->fail_payment($invoice, $auto, 'Não foi possível cancelar o boleto vencido. Tente novamente em instantes.');
+            }
+
+            $this->ci->db->where('id', $existing_transaction->id);
+            $this->ci->db->update(db_prefix() . 'pagou_transactions_boleto', ['status' => $is_dead ? $api_status : 'expired']);
+            $this->log('info', "Boleto {$existing_transaction->transaction_id} encerrado. Emitindo novo boleto para a Fatura ID {$invoice->id}.");
         }
 
         // --- Prepara os dados para enviar à API Pagou ---
+        // Vencimento atual ou futuro; o piso considera a data UTC usada pela API
+        $today = max(date('Y-m-d'), gmdate('Y-m-d'));
+        $effective_due_date = (!empty($invoice->duedate) && date('Y-m-d', strtotime($invoice->duedate)) > $today)
+            ? date('Y-m-d', strtotime($invoice->duedate))
+            : $today;
         $amount_formatted = round($invoice->total, 2);
         
         $description = hooks()->apply_filters(
@@ -323,7 +337,7 @@ class Pagou_boleto_gateway extends App_gateway
         $payment_data = [
             'amount'           => $amount_formatted,
             'description'      => mb_substr($description, 0, 140), // API Pagou: max 140 caracteres
-            'due_date'         => (!empty($invoice->duedate) && $invoice->duedate > date('Y-m-d')) ? date('Y-m-d', strtotime($invoice->duedate)) : date('Y-m-d'),
+            'due_date'         => $effective_due_date,
             'notification_url' => $notification_url,
             'external_id'      => $external_id,
             'payer'            => [
@@ -382,8 +396,11 @@ class Pagou_boleto_gateway extends App_gateway
                 
                 // Calcular a data limite do desconto com base nos dias antes do vencimento
                 $discount_days_before = (int) $this->getSetting('discount_limit_date');
-                $discount_limit_date = date('Y-m-d', strtotime($invoice->duedate . ' -' . $discount_days_before . ' days'));
-                
+                $discount_limit_date = date('Y-m-d', strtotime($effective_due_date . ' -' . $discount_days_before . ' days'));
+
+                if ($discount_limit_date < $today) {
+                    $this->log('info', 'Desconto omitido: data limite já passou.');
+                } else {
                 $api_discount_value = round(floatval(str_replace(',', '.', $discount_value_input)), 2);
                 $payment_data['discount'] = [
                     'type'       => $discount_type,
@@ -391,6 +408,7 @@ class Pagou_boleto_gateway extends App_gateway
                     'limit_date' => $discount_limit_date
                 ];
                 $this->log('debug', 'Desconto configurado para API:', $payment_data['discount']);
+                }
             }
         }
 
@@ -485,9 +503,7 @@ class Pagou_boleto_gateway extends App_gateway
         
         if ($curl_error) {
             $this->log('error', 'Erro cURL ao chamar API Pagou: ' . $curl_error);
-            set_alert('danger', 'Erro de comunicação com o gateway de pagamento. Detalhes: ' . $curl_error);
-            redirect(site_url('invoice/' . $invoice->id . '/' . $invoice->hash));
-            return false;
+            return $this->fail_payment($invoice, $auto, 'Erro de comunicação com o gateway de pagamento. Tente novamente em instantes.', true);
         }
 
         if ($http_code === 201) {
@@ -496,9 +512,7 @@ class Pagou_boleto_gateway extends App_gateway
 
             if (!$result || !isset($result->id)) {
                 $this->log('error', 'Resposta da API Pagou em formato inesperado: ' . $response_body);
-                set_alert('danger', 'Erro ao processar resposta do gateway de pagamento. Formato inesperado.');
-                redirect(site_url('invoice/' . $invoice->id . '/' . $invoice->hash));
-                return false;
+                return $this->fail_payment($invoice, $auto, 'Erro ao processar resposta do gateway de pagamento.', true);
             }
             
             $db_transaction_data = [
@@ -512,9 +526,9 @@ class Pagou_boleto_gateway extends App_gateway
                 'boleto_url'         => $result->boleto_url ?? '',
                 'amount'             => $invoice->total,
                 'amount_final'       => isset($result->amount) ? $result->amount : $invoice->total,
-                'status'             => $result->status ?? 'pending',
+                'status'             => pagou_normalize_status($result->status ?? 1, 'boleto'),
                 'date_created'       => date('Y-m-d H:i:s'),
-                'due_date'           => $invoice->duedate,
+                'due_date'           => $effective_due_date,
                 'api_request'        => json_encode($payment_data),
                 'api_response'       => $response_body,
                 'external_id'        => $external_id,
@@ -526,12 +540,12 @@ class Pagou_boleto_gateway extends App_gateway
 
             // NOVO: Salvar informações de PIX se disponíveis
             if (isset($result->payload) && isset($result->payload->qrcode_id)) {
-                $this->save_pix_data_from_boleto($invoice->id, $result);
+                pagou_save_linked_pix($invoice->id, $result);
                 $this->log('info', "Informações de PIX salvas para a fatura ID: {$invoice->id}");
             }
 
             // NOVO: Se for chamado de forma automática (por hook), retorna apenas os dados
-            if (isset($data['auto_generated']) && $data['auto_generated'] === true) {
+            if ($auto) {
                 return ['success' => true, 'transaction_id' => $result->id];
             }
 
@@ -545,9 +559,7 @@ class Pagou_boleto_gateway extends App_gateway
                 $error_message_from_api = $this->parsePagouError($result, $response_body);
             }
             $this->log('error', "Erro ao gerar Boleto na Pagou. HTTP Code: {$http_code}. API Message: {$error_message_from_api}. Raw Response: {$response_body}");
-            set_alert('danger', 'Erro ao gerar Boleto junto ao gateway: ' . $error_message_from_api . ' (Código Pagou: ' . $http_code . ')');
-            redirect(site_url('invoice/' . $invoice->id . '/' . $invoice->hash));
-            return false;
+            return $this->fail_payment($invoice, $auto, 'Erro ao gerar Boleto junto ao gateway: ' . $error_message_from_api . ' (Código Pagou: ' . $http_code . ')', $http_code >= 500);
         }
     }
 
@@ -571,8 +583,9 @@ class Pagou_boleto_gateway extends App_gateway
             }
         }
         
-        // Verifica se há dados de PIX relacionados ao boleto
-        $this->ci->db->where('invoice_id', $invoice->id);
+        // Pix vinculado a este boleto
+        pagou_ensure_schema_121();
+        $this->ci->db->where('boleto_transaction_id', $transaction->transaction_id);
         $pix_data = $this->ci->db->get(db_prefix() . 'pagou_transactions_pix')->row();
         
         $view_data = [
@@ -665,7 +678,7 @@ class Pagou_boleto_gateway extends App_gateway
         $this->log('info', "Atualizando dados locais do boleto ID: {$transaction->id}");
         
         $update_data = [
-            'status' => $api_data->status ?? $transaction->status,
+            'status' => isset($api_data->status) ? pagou_normalize_status($api_data->status, 'boleto') : $transaction->status,
             'barcode' => $api_data->payload->bar_code ?? $transaction->barcode,
             'barcode_url' => $api_data->payload->line ?? $transaction->barcode_url,
             'boleto_url' => $api_data->boleto_url ?? $transaction->boleto_url,
@@ -696,56 +709,79 @@ class Pagou_boleto_gateway extends App_gateway
      */
     public function save_pix_data_from_boleto($invoice_id, $boleto_data)
     {
-        $this->log('info', "Salvando dados de PIX para a fatura ID: {$invoice_id}");
-        
-        // Verifica se os dados necessários estão presentes
-        if (!isset($boleto_data->payload) || !isset($boleto_data->payload->qrcode_id)) {
-            $this->log('error', 'Dados de PIX não encontrados na resposta da API');
+        return pagou_save_linked_pix($invoice_id, $boleto_data);
+    }
+
+    /**
+     * Encerra o fluxo com erro: no modo automático só registra e retorna;
+     * na página do cliente mostra o alerta e volta para a fatura.
+     *
+     * @param object $invoice
+     * @param bool   $auto
+     * @param string $message
+     * @param bool   $uncertain Timeout ou 5xx: o boleto pode ter sido criado
+     * @return bool|string false, ou 'uncertain' no modo automático
+     */
+    private function fail_payment($invoice, $auto, $message, $uncertain = false)
+    {
+        $this->log('error', 'Fatura ID ' . $invoice->id . ': ' . $message);
+        if ($auto) {
+            return $uncertain ? 'uncertain' : false;
+        }
+        set_alert('danger', $message);
+        redirect(site_url('invoice/' . $invoice->id . '/' . $invoice->hash));
+        return false;
+    }
+
+    /**
+     * O boleto só deixa de ser pagável depois do vencimento mais a carência.
+     *
+     * @param object $transaction
+     * @return bool
+     */
+    private function boleto_is_expired($transaction)
+    {
+        if (empty($transaction->due_date)) {
             return false;
         }
-        
-        // Verifica se já existe um registro de PIX para esta fatura
-        $this->ci->db->where('invoice_id', $invoice_id);
-        $existing_pix = $this->ci->db->get(db_prefix() . 'pagou_transactions_pix')->row();
-        
-        // Prepara os dados para salvar
-        $pix_data = [
-            'invoice_id' => $invoice_id,
-            'cliente' => $boleto_data->payer->name ?? '',
-            'doc' => $boleto_data->payer->document ?? '',
-            'transaction_id' => $boleto_data->payload->qrcode_id,
-            'payment_method' => 'pix',
-            'qr_code' => $boleto_data->payload->image ?? '',
-            'qr_code_text' => $boleto_data->payload->data ?? '',
-            'amount' => $boleto_data->amount ?? 0,
-            'amount_final' => $boleto_data->amount ?? 0,
-            'status' => $boleto_data->status ?? 'pending',
-            'date_created' => date('Y-m-d H:i:s'),
-            'external_id' => $boleto_data->external_id ?? '',
-            'api_response' => json_encode($boleto_data)
-        ];
-        
-        if ($existing_pix) {
-            // Atualiza o registro existente
-            $this->ci->db->where('id', $existing_pix->id);
-            $this->ci->db->update(db_prefix() . 'pagou_transactions_pix', $pix_data);
-            $this->log('info', "Dados de PIX atualizados para o ID: {$existing_pix->id}");
-        } else {
-            // Insere um novo registro
-            $this->ci->db->insert(db_prefix() . 'pagou_transactions_pix', $pix_data);
-            $inserted_id = $this->ci->db->insert_id();
-            $this->log('info', "Dados de PIX inseridos com ID: {$inserted_id}");
+        $grace = 1;
+        if ($this->getSetting('enable_grace_period') === '1' && is_numeric($this->getSetting('grace_period_days'))) {
+            $grace = min(max((int) $this->getSetting('grace_period_days'), 1), 30);
         }
-        
-        return true;
+        $limit = strtotime(date('Y-m-d', strtotime($transaction->due_date)) . ' 23:59:59 +' . $grace . ' days');
+
+        return time() > $limit;
     }
-    
+
     /**
-     * Gera um ID externo único para a fatura
-     * 
-     * @param int $invoice_id ID da fatura
-     * @return string ID externo único
+     * Solicita o cancelamento do boleto na API (204 = pedido aceito).
+     *
+     * @param string $transaction_id
+     * @return bool
      */
+    private function cancel_boleto_api($transaction_id)
+    {
+        $ch = curl_init(pagou_api_base_url($this->getSetting('is_production') === '1') . '/v1/charges/' . rawurlencode($transaction_id));
+        curl_setopt_array($ch, [
+            CURLOPT_CUSTOMREQUEST  => 'DELETE',
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER     => [
+                'Accept: application/json',
+                'User-Agent: pagou-perfex/1.2.1',
+                'X-API-KEY: ' . $this->decryptSetting('api_token'),
+            ],
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_TIMEOUT        => 30,
+            CURLOPT_FOLLOWLOCATION => false,
+        ]);
+        curl_exec($ch);
+        $http_code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        $this->log('info', "Cancelamento do boleto {$transaction_id}: HTTP {$http_code}");
+
+        return $http_code === 204;
+    }
+
     private function generate_external_id($invoice_id) {
         // Combina ID da fatura com timestamp e string aleatória para evitar duplicações
         $random_string = substr(str_shuffle('abcdefghijklmnopqrstuvwxyz0123456789'), 0, 10);
