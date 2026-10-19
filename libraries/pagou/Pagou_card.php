@@ -121,7 +121,7 @@ class Pagou_card
             if (Pagou_split::enabled_for(self::GATEWAY)) {
                 $split = (new Pagou_split())->resolve($invoice, 'cartao', $amount, $split_error);
                 if ($split_error) {
-                    $this->log_activity($invoice->id, 'Pagou: cobrança de cartão não criada. ' . $split_error);
+                    (new Pagou_split())->log_config_error($invoice->id, $split_error);
                     return ['result' => 'error', 'message' => 'O pagamento com cartão está indisponível no momento.'];
                 }
                 if ($split) {
@@ -154,6 +154,11 @@ class Pagou_card
             $row = $this->apply_create_response($row_id, $response);
             if ($split && $row && $row->pagou_charge_id) {
                 (new Pagou_split())->snapshot('cartao', $row->pagou_charge_id, $invoice->id, $split, $response->body['split'] ?? null);
+            }
+            // Recusa por configuração de split não é problema do cartão do comprador
+            if ($split && $row && $row->status === 'failed' && Pagou_split::is_api_split_error($row->failure_reason)) {
+                (new Pagou_split())->log_config_error($invoice->id, 'A Pagou recusou o split: ' . $row->failure_reason);
+                return ['result' => 'error', 'message' => 'O pagamento com cartão está indisponível no momento. Use outra forma de pagamento.'];
             }
 
             // Baixa ainda dentro da trava: outra aba só segue depois dela
@@ -248,7 +253,14 @@ class Pagou_card
             return $row;
         }
 
-        return $this->apply_create_response($row->id, $api->create_card_charge($raw, $row->idempotency_key));
+        $response = $api->create_card_charge($raw, $row->idempotency_key);
+        $updated = $this->apply_create_response($row->id, $response);
+        $request = json_decode($raw, true);
+        if (!empty($request['split']) && $updated && $updated->pagou_charge_id) {
+            (new Pagou_split())->snapshot('cartao', $updated->pagou_charge_id, $updated->invoice_id, $request['split'], $response->body['split'] ?? null);
+        }
+
+        return $updated;
     }
 
     /**

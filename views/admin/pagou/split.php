@@ -55,8 +55,8 @@ $method_labels = ['pix' => 'Pix', 'boleto' => 'Boleto', 'cartao' => 'Cartão'];
                 <tr>
                   <td><?php echo $rule->scope === 'client' ? 'Cliente: ' . $e($rule->client_company ?: '#' . $rule->scope_id) : 'Global'; ?></td>
                   <td><?php echo $e($rule->recipient_name); ?></td>
-                  <td><?php echo $rule->type === 'percentage' ? 'Percentual' : 'Fixo (R$)'; ?></td>
-                  <td><?php echo $rule->type === 'percentage' ? $e(rtrim(rtrim(number_format($rule->value, 4, ',', ''), '0'), ',')) . '%' : 'R$ ' . $e(number_format($rule->value, 2, ',', '.')); ?></td>
+                  <td><?php echo $rule->type === 'percentage' ? 'Percentual' : ($rule->type === 'none' ? 'Sem split' : 'Fixo (R$)'); ?></td>
+                  <td><?php echo $rule->type === 'none' ? '—' : ($rule->type === 'percentage' ? $e(rtrim(rtrim(number_format($rule->value, 4, ',', ''), '0'), ',')) . '%' : 'R$ ' . $e(number_format($rule->value, 2, ',', '.'))); ?></td>
                   <td><?php echo $e(implode(', ', array_map(function ($m) use ($method_labels) { return $method_labels[$m] ?? $m; }, explode(',', $rule->methods)))); ?></td>
                   <td>
                     <?php echo form_open(admin_url('pagou/split_admin/delete_rule/' . (int) $rule->id), ['style' => 'display:inline', 'onsubmit' => "return confirm('Remover esta regra?');"]); ?>
@@ -81,7 +81,8 @@ $method_labels = ['pix' => 'Pix', 'boleto' => 'Boleto', 'cartao' => 'Cartão'];
               </select>
               <select class="form-control" name="type">
                 <option value="percentage">Percentual</option>
-                <option value="fixed">Fixo (R$)</option>
+                <option value="fixed">Fixo (R$, proporcional ao saldo cobrado)</option>
+                <option value="none">Sem split (isentar o cliente)</option>
               </select>
               <input class="form-control" name="value" placeholder="Valor" style="width: 100px;" required>
               <label><input type="checkbox" name="methods[]" value="pix" checked> Pix</label>

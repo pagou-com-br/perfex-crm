@@ -81,6 +81,9 @@ class Card_admin extends AdminController
 
         $staff = get_staff_full_name(get_staff_user_id());
         if ($response->ok()) {
+            if ((new Pagou_split())->on_reversal('cartao', $row->pagou_charge_id, $row->invoice_id)) {
+                set_alert('warning', 'Esta cobrança tem split: o estorno depende da recuperação dos repasses aos recebedores.');
+            }
             list(, $message) = (new Pagou_events())->settle_card($this->row($id));
             $this->log($row->invoice_id, 'Estorno da cobrança de cartão ' . $row->pagou_charge_id . ' solicitado por ' . $staff . '. Ajuste o pagamento da fatura.');
             set_alert('success', 'Estorno solicitado à Pagou. ' . $message);

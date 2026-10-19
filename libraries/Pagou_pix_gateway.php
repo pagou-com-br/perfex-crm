@@ -174,7 +174,7 @@ class Pagou_pix_gateway extends App_gateway
             }
 
             $expired = strtotime($row->date_created) + (int) $row->expiration_seconds <= time() + 60;
-            $same_amount = abs((float) $row->amount - $amount) < 0.005;
+            $same_amount = abs((float) $row->amount - $amount) < 0.005 && $this->split_matches($invoice, $row, $amount);
             if (!$expired && $same_amount && $row->qr_code_text !== '') {
                 return $row;
             }
@@ -238,6 +238,10 @@ class Pagou_pix_gateway extends App_gateway
                 'status'         => pagou_normalize_status($body['status'] ?? 1),
                 'api_response'   => json_encode(pagou_redact($body)),
             ]);
+            $request = json_decode((string) $row->api_request, true);
+            if (!empty($request['split'])) {
+                (new Pagou_split())->snapshot('pix', $item['id'], $row->invoice_id, $request['split'], $body['split'] ?? null);
+            }
             return $this->ci->db->where('id', $row->id)->get($table)->row();
         }
 
@@ -248,6 +252,23 @@ class Pagou_pix_gateway extends App_gateway
         $this->ci->db->where('id', $row->id)->update($table, ['status' => 'failed']);
 
         return null;
+    }
+
+    /**
+     * O split da cobrança existente ainda corresponde às regras atuais?
+     * Regra inválida agora não força reemissão (mantém a cobrança vigente).
+     */
+    private function split_matches($invoice, $row, $amount)
+    {
+        $expected = [];
+        if (Pagou_split::enabled_for('pagou_pix')) {
+            $expected = (new Pagou_split())->resolve($invoice, 'pix', $amount, $split_error);
+            if ($split_error) {
+                return true;
+            }
+        }
+
+        return Pagou_split::hash($expected) === (string) ($row->split_hash ?? '');
     }
 
     private function create_charge(Pagou_api $api, $invoice, $amount, &$error)
@@ -296,8 +317,7 @@ class Pagou_pix_gateway extends App_gateway
         if (Pagou_split::enabled_for('pagou_pix')) {
             $split = (new Pagou_split())->resolve($invoice, 'pix', $amount, $split_error);
             if ($split_error) {
-                $this->ci->load->model('invoices_model');
-                $this->ci->invoices_model->log_invoice_activity($invoice->id, 'Pagou: cobrança não emitida. ' . $split_error);
+                (new Pagou_split())->log_config_error($invoice->id, $split_error);
                 $error = 'O pagamento por Pix está indisponível no momento (configuração de split).';
                 return null;
             }
@@ -321,6 +341,7 @@ class Pagou_pix_gateway extends App_gateway
             'status'             => 'creating',
             'date_created'       => date('Y-m-d H:i:s'),
             'expiration_seconds' => $expiration_seconds,
+            'split_hash'         => Pagou_split::hash($split),
         ]);
         $row_id = $this->ci->db->insert_id();
         $customer_code = 'perfex-' . $invoice->id . '-' . $row_id;
@@ -352,6 +373,11 @@ class Pagou_pix_gateway extends App_gateway
         }
 
         $this->ci->db->where('id', $row_id)->update($table, ['status' => 'failed', 'api_response' => json_encode($response->body)]);
+        if ($split && Pagou_split::is_api_split_error($response->error_message())) {
+            (new Pagou_split())->log_config_error($invoice->id, 'A Pagou recusou o split: ' . $response->error_message());
+            $error = 'O pagamento por Pix está indisponível no momento.';
+            return null;
+        }
         $error = 'Não foi possível gerar o Pix: ' . $response->error_message();
 
         return null;

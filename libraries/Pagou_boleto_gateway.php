@@ -167,7 +167,7 @@ class Pagou_boleto_gateway extends App_gateway
                 continue; // encerrado na Pagou
             }
 
-            $same_amount = abs((float) $row->amount - $amount) < 0.005;
+            $same_amount = abs((float) $row->amount - $amount) < 0.005 && $this->split_matches($invoice, $row, $amount);
             if (!$this->is_expired($row, $charge) && $same_amount) {
                 return $this->reload($row);
             }
@@ -219,6 +219,10 @@ class Pagou_boleto_gateway extends App_gateway
                 'status'         => pagou_normalize_status($item['status'] ?? 1, 'boleto'),
                 'api_response'   => json_encode(pagou_redact($item)),
             ]);
+            $request = json_decode((string) $row->api_request, true);
+            if (!empty($request['split'])) {
+                (new Pagou_split())->snapshot('boleto', $item['id'], $row->invoice_id, $request['split'], $item['split'] ?? null);
+            }
             return $this->reload($row);
         }
         if (time() < strtotime($row->date_created) + 360) {
@@ -227,6 +231,23 @@ class Pagou_boleto_gateway extends App_gateway
         $this->ci->db->where('id', $row->id)->update($table, ['status' => 'failed']);
 
         return null;
+    }
+
+    /**
+     * O split da cobrança existente ainda corresponde às regras atuais?
+     * Regra inválida agora não força reemissão (mantém a cobrança vigente).
+     */
+    private function split_matches($invoice, $row, $amount)
+    {
+        $expected = [];
+        if (Pagou_split::enabled_for('pagou_boleto')) {
+            $expected = (new Pagou_split())->resolve($invoice, 'boleto', $amount, $split_error);
+            if ($split_error) {
+                return true;
+            }
+        }
+
+        return Pagou_split::hash($expected) === (string) ($row->split_hash ?? '');
     }
 
     private function create_boleto(Pagou_api $api, $invoice, $amount, &$error, &$uncertain)
@@ -261,9 +282,9 @@ class Pagou_boleto_gateway extends App_gateway
         if (Pagou_split::enabled_for('pagou_boleto')) {
             $split = (new Pagou_split())->resolve($invoice, 'boleto', $amount, $split_error);
             if ($split_error) {
-                $this->ci->load->model('invoices_model');
-                $this->ci->invoices_model->log_invoice_activity($invoice->id, 'Pagou: cobrança não emitida. ' . $split_error);
+                (new Pagou_split())->log_config_error($invoice->id, $split_error);
                 $error = 'O pagamento por boleto está indisponível no momento (configuração de split).';
+                $uncertain = self::LATER; // o cron tenta de novo depois que a regra for corrigida
                 return null;
             }
             if ($split) {
@@ -286,6 +307,7 @@ class Pagou_boleto_gateway extends App_gateway
             'status'         => 'creating',
             'date_created'   => date('Y-m-d H:i:s'),
             'due_date'       => $due_date,
+            'split_hash'     => Pagou_split::hash($split),
         ]);
         $row_id = $this->ci->db->insert_id();
         $body['customer_code'] = 'perfex-' . $invoice->id . '-b' . $row_id;
@@ -316,6 +338,12 @@ class Pagou_boleto_gateway extends App_gateway
         }
 
         $this->ci->db->where('id', $row_id)->update($table, ['status' => 'failed', 'api_response' => json_encode(pagou_redact($response->body))]);
+        if ($split && Pagou_split::is_api_split_error($response->error_message())) {
+            (new Pagou_split())->log_config_error($invoice->id, 'A Pagou recusou o split: ' . $response->error_message());
+            $error = 'O pagamento por boleto está indisponível no momento.';
+            $uncertain = self::LATER;
+            return null;
+        }
         $error = 'Não foi possível gerar o boleto: ' . $response->error_message();
 
         return null;

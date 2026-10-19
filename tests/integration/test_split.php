@@ -51,7 +51,8 @@ $db->insert('tblpagou_split_rules', ['scope' => 'client', 'scope_id' => 1, 'reci
 $split = (new Pagou_split())->resolve(inv(60), 'pix', 100, $err);
 t('regra do cliente substitui as globais', $split === [['customer_id' => $B, 'type' => 'percentage', 'value' => 10.0]]);
 $db->where('scope', 'client')->delete('tblpagou_split_rules');
-$split = (new Pagou_split())->resolve(inv(60), 'pix', 30, $err);
+$db->insert('tblinvoices', ['id' => 61, 'total' => 30, 'status' => 1, 'invoice_pagou' => 1, 'hash' => 'h61', 'duedate' => null, 'clientid' => 1]);
+$split = (new Pagou_split())->resolve(inv(61), 'pix', 30, $err);
 t('acima da margem para tarifas: erro e nenhum split', $split === [] && strpos($err, 'margem mínima') !== false);
 
 echo "Pix com split\n";
@@ -62,7 +63,6 @@ $req = json_decode(last_call('POST /v1/pix')['body'], true);
 t('split no corpo da criação', isset($req['split']) && count($req['split']) === 2);
 $snap = $db->where('charge_id', 'sp-1')->get('tblpagou_split_snapshots')->row();
 t('snapshot gravado com status 1', $snap && (int) $snap->split_status === 1 && (float) $snap->fee === 1.0);
-$db->insert('tblinvoices', ['id' => 61, 'total' => 30, 'status' => 1, 'invoice_pagou' => 1, 'hash' => 'h61', 'duedate' => null, 'clientid' => 1]);
 reset_calls();
 t('regra inválida bloqueia a emissão', pay(61) === 'redirect' && last_call('POST /v1/pix') === null);
 
@@ -88,6 +88,53 @@ update_option('pagou_last_reconcile', '0');
 $snap = $db->where('charge_id', 'sp-1')->get('tblpagou_split_snapshots')->row();
 $found = false; foreach ($GLOBALS['__activity'] as $a) { if (strpos($a[1], 'ação necessária') !== false) { $found = true; } }
 t('status 6 atualizado e vira atividade na fatura', (int) $snap->split_status === 6 && $found);
+
+echo "Revisão: precedência, isenção, saldo e arredondamento\n";
+$db->insert('tblpagou_split_recipients', ['name' => 'Parceiro C', 'customer_uuid' => '60000000-0000-4000-8000-000000000005', 'active' => 0, 'created_at' => date('Y-m-d H:i:s')]); $rc = $db->insert_id();
+$db->insert('tblpagou_split_rules', ['scope' => 'client', 'scope_id' => 1, 'recipient_id' => $rc, 'type' => 'percentage', 'value' => 30, 'methods' => 'pix', 'active' => 1, 'created_at' => date('Y-m-d H:i:s')]);
+$split = (new Pagou_split())->resolve(inv(60), 'pix', 100, $err);
+t('recebedor inativo na regra do cliente não cai nas globais', $split === [] && $err === null);
+$db->where('scope', 'client')->delete('tblpagou_split_rules');
+$db->insert('tblpagou_split_rules', ['scope' => 'client', 'scope_id' => 1, 'recipient_id' => 0, 'type' => 'none', 'value' => 0, 'methods' => 'pix', 'active' => 1, 'created_at' => date('Y-m-d H:i:s')]);
+t('regra "sem split" isenta o cliente', (new Pagou_split())->resolve(inv(60), 'pix', 100, $err) === []);
+$db->where('scope', 'client')->delete('tblpagou_split_rules');
+$db->insert('tblinvoices', ['id' => 63, 'total' => 1000, 'status' => 3, 'invoice_pagou' => 1, 'hash' => 'h63', 'duedate' => null, 'clientid' => 1]);
+$split = (new Pagou_split())->resolve(inv(63), 'cartao', 200, $err);
+t('fixo proporcional ao saldo cobrado (R$ 20 de 1000 → R$ 4 em 200)', $split === [['customer_id' => $A, 'type' => 'fixed', 'value' => 4.0]]);
+t('meio centavo arredonda para cima (50% de 113 = 57)', Pagou_split::percent_cents(113, 50) === 57 && Pagou_split::percent_cents(100, 33.3333) === 33);
+
+echo "Revisão: recuperação ganha acompanhamento\n";
+$db->insert('tblinvoices', ['id' => 64, 'total' => 100, 'status' => 1, 'invoice_pagou' => 1, 'hash' => 'h64', 'duedate' => null, 'clientid' => 1]);
+api(['POST /v1/pix' => ['code' => 502]]);
+pay(64);
+$row64 = $db->where('invoice_id', 64)->get('tblpagou_transactions_pix')->row();
+$db->where('id', $row64->id)->update('tblpagou_transactions_pix', ['date_created' => date('Y-m-d H:i:s', time() - 400)]);
+api(['GET /v1/pix' => ['code' => 200, 'body' => [['id' => 'sp-rec', 'customer_code' => $row64->customer_code, 'status' => 2]]],
+     'GET /v1/pix/sp-rec' => ['code' => 200, 'body' => ['id' => 'sp-rec', 'status' => 2, 'payload' => ['data' => 'C', 'image' => ''], 'split' => ['status' => 1]]]]);
+pay(64);
+t('Pix adotado pela listagem ganha snapshot do split', $db->where('charge_id', 'sp-rec')->count_all_results('tblpagou_split_snapshots') === 1);
+$card_row = $db->where('invoice_id', 62)->get('tblpagou_card_charges')->row();
+t('cartão recuperado por repetição ganha snapshot', $db->where('charge_id', $card_row->pagou_charge_id)->count_all_results('tblpagou_split_snapshots') === 1);
+
+echo "Revisão: regra mudou e a cobrança reaproveitada é reemitida\n";
+$db->insert('tblinvoices', ['id' => 65, 'total' => 100, 'status' => 1, 'invoice_pagou' => 1, 'hash' => 'h65', 'duedate' => null, 'clientid' => 1]);
+api(['POST /v1/pix' => ['code' => 201, 'body' => ['id' => 'sp-h1', 'status' => 2, 'payload' => ['data' => 'C1', 'image' => '']]]]);
+pay(65);
+$db->where('recipient_id', $rb)->update('tblpagou_split_rules', ['value' => 30]);
+reset_calls();
+api(['DELETE /v1/pix/sp-h1' => ['code' => 204], 'GET /v1/pix/sp-h1' => ['code' => 200, 'body' => ['id' => 'sp-h1', 'status' => 2]], 'POST /v1/pix' => ['code' => 201, 'body' => ['id' => 'sp-h2', 'status' => 2, 'payload' => ['data' => 'C2', 'image' => '']]]]);
+pay(65);
+t('split diferente: cancela e reemite', last_call('DELETE /v1/pix/sp-h1') !== null && last_call('POST /v1/pix') !== null);
+$db->where('recipient_id', $rb)->update('tblpagou_split_rules', ['value' => 25]);
+
+echo "Revisão: recusa de split pela API\n";
+$db->insert('tblinvoices', ['id' => 66, 'total' => 100, 'status' => 1, 'invoice_pagou' => 1, 'hash' => 'h66', 'duedate' => null, 'clientid' => 1]);
+$db->where('name', 'pagou_split_err_66')->delete('tbloptions');
+api(['POST /v1/pix' => ['code' => 400, 'body' => ['error' => 'payment amount must cover allocations and fees']]]);
+$GLOBALS['__activity'] = [];
+pay(66);
+$logged = false; foreach ($GLOBALS['__activity'] as $a) { if (strpos($a[1], 'recusou o split') !== false) { $logged = true; } }
+t('pagador vê mensagem genérica e o staff recebe o motivo', strpos($GLOBALS['__alert'][1], 'allocations') === false && $logged);
 
 echo "\n$ok ok, $fail falhas\n";
 exit($fail ? 1 : 0);

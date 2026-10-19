@@ -143,6 +143,8 @@ class Pagou_schema
         }
 
         self::add_column($card, 'reverse_key', 'varchar(100) DEFAULT NULL');
+        self::add_column($pix, 'split_hash', 'char(40) DEFAULT NULL');
+        self::add_column($boleto, 'split_hash', 'char(40) DEFAULT NULL');
         self::add_column($card, 'reverse_state', 'varchar(20) DEFAULT NULL');
 
         self::add_column($pix, 'boleto_transaction_id', 'varchar(255) DEFAULT NULL');

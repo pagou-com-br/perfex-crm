@@ -161,6 +161,7 @@ class Pagou extends AdminController
      */
     public function reembolso_ajax()
     {
+        pagou_load_libraries();
         if ($this->input->method() !== 'delete') {
             header('Content-Type: application/json');
             echo json_encode(['status' => 'error', 'message' => 'Método não permitido.']);
@@ -320,9 +321,11 @@ class Pagou extends AdminController
                                 number_format($refund_amount, 2, ',', '.') .
                                 " | Fatura: #{$transaction->invoice_prefix}{$transaction->invoice_number}");
 
+            $has_split = (new Pagou_split())->on_reversal('pix', $transaction_id_to_use, $transaction->invoice_id);
             echo json_encode([
                 'status' => 'success',
-                'message' => 'Estorno solicitado à Pagou. A fatura será atualizada quando a devolução for confirmada.',
+                'message' => 'Estorno solicitado à Pagou. A fatura será atualizada quando a devolução for confirmada.'
+                    . ($has_split ? ' Esta cobrança tem split: a devolução depende da recuperação dos repasses.' : ''),
                 'transaction' => [
                     'id' => $transaction_id,
                     'refund_amount' => $refund_amount,
@@ -355,6 +358,10 @@ class Pagou extends AdminController
             return;
         }
 
+        if (Pagou_split::is_api_split_error($api_error) || ($http_code === 400 && (new Pagou_split())->has_split('pix', $transaction_id_to_use))) {
+            echo json_encode(['status' => 'error', 'message' => 'A Pagou recusou a devolução. A cobrança tem split: confira o saldo e as restrições dos recebedores. Detalhe: ' . $api_error]);
+            return;
+        }
         echo json_encode(['status' => 'error', 'message' => 'Erro ao solicitar estorno PIX. ' . $this->translateApiError($api_error)]);
     }
 

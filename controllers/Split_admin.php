@@ -69,6 +69,7 @@ class Split_admin extends AdminController
         $row = $this->db->where('id', (int) $id)->get($table)->row();
         if ($row) {
             $this->db->where('id', $row->id)->update($table, ['active' => $row->active ? 0 : 1]);
+            log_activity('Pagou split: recebedor ' . $row->name . ($row->active ? ' desativado' : ' ativado'));
         }
         redirect(admin_url('pagou/split_admin'));
     }
@@ -79,15 +80,66 @@ class Split_admin extends AdminController
         $scope = $this->input->post('scope') === 'client' ? 'client' : 'global';
         $scope_id = $scope === 'client' ? (int) $this->input->post('client_id') : 0;
         $recipient_id = (int) $this->input->post('recipient_id');
-        $type = $this->input->post('type') === 'percentage' ? 'percentage' : 'fixed';
+        $type = in_array($this->input->post('type'), ['percentage', 'fixed', 'none'], true) ? $this->input->post('type') : 'fixed';
         $value = round((float) str_replace(',', '.', (string) $this->input->post('value')), $type === 'percentage' ? 4 : 2);
         $methods = array_values(array_intersect((array) $this->input->post('methods'), Pagou_split::METHODS));
+        $back = admin_url('pagou/split_admin');
 
-        $recipient_ok = $this->db->where('id', $recipient_id)->count_all_results(db_prefix() . 'pagou_split_recipients') > 0;
-        $client_ok = $scope === 'global' || $this->db->where('userid', $scope_id)->count_all_results(db_prefix() . 'clients') > 0;
-        if (!$recipient_ok || !$client_ok || !$methods || $value <= 0 || ($type === 'percentage' && $value > 100)) {
-            set_alert('danger', 'Regra inválida: confira recebedor, cliente, meios de pagamento e valor (percentual até 100; fixo em reais).');
-            redirect(admin_url('pagou/split_admin'));
+        $fail = function ($message) use ($back) {
+            set_alert('danger', $message);
+            redirect($back);
+        };
+        if (!$methods) {
+            $fail('Escolha ao menos um meio de pagamento.');
+        }
+        if ($scope === 'client' && $this->db->where('userid', $scope_id)->count_all_results(db_prefix() . 'clients') === 0) {
+            $fail('Cliente não encontrado.');
+        }
+        if ($type === 'none') {
+            if ($scope !== 'client') {
+                $fail('"Sem split" só vale para um cliente específico.');
+            }
+            $recipient_id = 0;
+            $value = 0;
+        } else {
+            $recipient = $this->db->where('id', $recipient_id)->get(db_prefix() . 'pagou_split_recipients')->row();
+            if (!$recipient || !$recipient->active) {
+                $fail('Escolha um recebedor ativo.');
+            }
+            if ($value <= 0 || ($type === 'percentage' && $value > 100) || ($type === 'fixed' && $value > Pagou_split::MAX_FIXED)) {
+                $fail('Valor inválido: percentual entre 0 e 100 (até 4 casas) ou valor fixo em reais.');
+            }
+        }
+
+        // Regras existentes do mesmo escopo, por meio: duplicidade, limite de 10 e soma dos percentuais
+        $existing = $this->db->where('scope', $scope)->where('scope_id', $scope_id)->where('active', 1)
+            ->get(db_prefix() . 'pagou_split_rules')->result();
+        $margin = Pagou_split::margin();
+        foreach ($methods as $method) {
+            $same_method = array_filter($existing, function ($r) use ($method) {
+                return in_array($method, explode(',', $r->methods), true);
+            });
+            foreach ($same_method as $r) {
+                if ($type === 'none' || $r->type === 'none') {
+                    $fail('Já existe regra para este cliente no meio ' . $method . ' que conflita com "sem split". Remova-a antes.');
+                }
+                if ((int) $r->recipient_id === $recipient_id) {
+                    $fail('Este recebedor já tem regra neste escopo para o meio ' . $method . '.');
+                }
+            }
+            if ($type === 'none') {
+                continue;
+            }
+            if (count($same_method) >= 10) {
+                $fail('O split aceita no máximo 10 recebedores por pagamento (meio ' . $method . ').');
+            }
+            $percent = $type === 'percentage' ? $value : 0;
+            foreach ($same_method as $r) {
+                $percent += $r->type === 'percentage' ? (float) $r->value : 0;
+            }
+            if ($percent > 100 - $margin) {
+                $fail('Os percentuais do meio ' . $method . ' somariam ' . $percent . '%, acima de ' . (100 - $margin) . '% (margem para tarifas).');
+            }
         }
 
         $this->db->insert(db_prefix() . 'pagou_split_rules', [
@@ -100,15 +152,16 @@ class Split_admin extends AdminController
             'active'       => 1,
             'created_at'   => date('Y-m-d H:i:s'),
         ]);
-        log_activity('Pagou split: regra ' . $scope . ($scope_id ? ' #' . $scope_id : '') . ' cadastrada');
-        set_alert('success', 'Regra cadastrada. Ela vale para novas cobranças; pagamentos já criados não mudam.');
-        redirect(admin_url('pagou/split_admin'));
+        log_activity('Pagou split: regra ' . $type . ' ' . $scope . ($scope_id ? ' #' . $scope_id : '') . ' cadastrada (' . implode(',', $methods) . ')');
+        set_alert('success', 'Regra cadastrada. Ela vale para novas cobranças; Pix e boletos em aberto são reemitidos na próxima visita do cliente.');
+        redirect($back);
     }
 
     public function delete_rule($id = 0)
     {
         $this->require_post();
         $this->db->where('id', (int) $id)->delete(db_prefix() . 'pagou_split_rules');
+        log_activity('Pagou split: regra #' . (int) $id . ' removida');
         set_alert('success', 'Regra removida.');
         redirect(admin_url('pagou/split_admin'));
     }
@@ -118,6 +171,7 @@ class Split_admin extends AdminController
         $this->require_post();
         $margin = max(0, min(90, (float) str_replace(',', '.', (string) $this->input->post('margin'))));
         update_option('pagou_split_min_margin_pct', (string) $margin);
+        log_activity('Pagou split: margem mínima alterada para ' . $margin . '%');
         set_alert('success', 'Margem mínima atualizada.');
         redirect(admin_url('pagou/split_admin'));
     }

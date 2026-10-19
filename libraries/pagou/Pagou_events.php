@@ -246,7 +246,7 @@ class Pagou_events
 
         $body = $response->body;
         if (isset($body['split'])) {
-            (new Pagou_split())->track('pix', $pix->transaction_id, $body['split']);
+            (new Pagou_split())->track('pix', $pix->transaction_id, $body['split'], $pix->invoice_id);
         }
         $status = isset($body['status']) ? (int) $body['status'] : 0;
         $refund = isset($body['refund']) && is_array($body['refund']) ? $body['refund'] : null;
@@ -364,7 +364,7 @@ class Pagou_events
         }
 
         if (isset($response->body['split'])) {
-            (new Pagou_split())->track('cartao', $row->pagou_charge_id, $response->body['split']);
+            (new Pagou_split())->track('cartao', $row->pagou_charge_id, $response->body['split'], $row->invoice_id);
         }
         $status = Pagou_card::status($response->body['status'] ?? 'unknown');
         $previous = $row->status;
@@ -563,7 +563,7 @@ class Pagou_events
         }
         $charge = json_decode(json_encode($response->body));
         if (isset($charge->split)) {
-            (new Pagou_split())->track('boleto', $boleto->transaction_id, $charge->split);
+            (new Pagou_split())->track('boleto', $boleto->transaction_id, $charge->split, $boleto->invoice_id);
         }
 
         $status = pagou_boleto_api_is_paid($charge) ? 'paid' : pagou_normalize_status($charge->status ?? null, 'boleto');
@@ -603,6 +603,9 @@ class Pagou_events
             return;
         }
         $this->set_option('pagou_last_reconcile', (string) time());
+
+        // Split primeiro, com prazo próprio: pagamento confirmado não significa repasse concluído
+        $this->reconcile_split(time() + 8);
 
         $deadline = time() + 25;
         $settlements = db_prefix() . 'pagou_settlements';
@@ -668,32 +671,57 @@ class Pagou_events
             $this->settle_card($row);
         }
 
-        // Split: distribuições ainda não concluídas (pagamento confirmado não significa repasse concluído)
-        $api_by_method = [
+        // Retenção: eventos com mais de 90 dias
+        $this->ci->db->where('created_at <', date('Y-m-d H:i:s', strtotime('-90 days')))
+            ->delete(db_prefix() . 'pagou_webhook_events');
+    }
+
+    /**
+     * Acompanha distribuições de split pendentes; tira da fila pagamentos encerrados sem pagamento
+     * e alerta quando a API não devolve o split de um pagamento confirmado.
+     */
+    private function reconcile_split($deadline)
+    {
+        $getters = [
             'pix'    => ['pagou_pix', 'get_pix'],
             'boleto' => ['pagou_boleto', 'get_charge'],
             'cartao' => [Pagou_card::GATEWAY, 'get_card_charge'],
         ];
         $split = new Pagou_split();
         foreach ($split->pending_snapshots(10) as $snapshot) {
-            if (time() > $deadline || !isset($api_by_method[$snapshot->method])) {
+            if (time() > $deadline || !isset($getters[$snapshot->method])) {
                 break;
             }
-            list($gateway_id, $getter) = $api_by_method[$snapshot->method];
+            list($gateway_id, $getter) = $getters[$snapshot->method];
             $api = Pagou_api::for_gateway($gateway_id);
             if (!$api) {
                 continue;
             }
-            $response = $api->$getter($snapshot->charge_id);
             $this->ci->db->where('id', $snapshot->id)->update(db_prefix() . 'pagou_split_snapshots', ['last_checked_at' => date('Y-m-d H:i:s')]);
-            if ($response->ok() && is_array($response->body) && isset($response->body['split'])) {
-                $split->track($snapshot->method, $snapshot->charge_id, $response->body['split']);
+            $response = $api->$getter($snapshot->charge_id);
+            if (!$response->ok() || !is_array($response->body)) {
+                continue;
+            }
+            $body = $response->body;
+            if (isset($body['split'])) {
+                $split->track($snapshot->method, $snapshot->charge_id, $body['split'], $snapshot->invoice_id);
+            }
+
+            $status = $body['status'] ?? null;
+            $paid = $snapshot->method === 'cartao'
+                ? in_array(Pagou_card::status($status), ['captured', 'settled'], true)
+                : ($snapshot->method === 'boleto' ? pagou_boleto_api_is_paid(json_decode(json_encode($body))) : in_array((int) $status, [4, 5], true));
+            $closed = $snapshot->method === 'cartao'
+                ? in_array(Pagou_card::status($status), ['failed', 'canceled'], true)
+                : in_array((int) $status, $snapshot->method === 'boleto' ? [3, 6, 7] : [3, 6], true);
+
+            if (!$paid && $closed) {
+                $split->close($snapshot->method, $snapshot->charge_id, Pagou_split::STATUS_CLOSED);
+            } elseif ($paid && !isset($body['split']) && $snapshot->split_status === null) {
+                $split->close($snapshot->method, $snapshot->charge_id, Pagou_split::STATUS_MISSING,
+                    'A cobrança ' . $snapshot->charge_id . ' foi paga, mas a Pagou não informou o split enviado. Confira a distribuição no painel da Pagou.');
             }
         }
-
-        // Retenção: eventos com mais de 90 dias
-        $this->ci->db->where('created_at <', date('Y-m-d H:i:s', strtotime('-90 days')))
-            ->delete(db_prefix() . 'pagou_webhook_events');
     }
 
     // ================================================================ utilitários
