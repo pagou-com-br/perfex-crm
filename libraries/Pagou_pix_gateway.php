@@ -281,7 +281,7 @@ class Pagou_pix_gateway extends App_gateway
         $client_email = $this->get_client_email($invoice);
 
         $custom_webhook_url = trim($this->getSetting('webhook_url'));
-        $notification_url = !empty($custom_webhook_url) ? $custom_webhook_url : admin_url('pagou/pagou_webhook/process/');
+        $notification_url = !empty($custom_webhook_url) ? $custom_webhook_url : site_url('pagou/pagou_webhook/process');
         
         $this->log('debug', 'URL de Notificação configurada: ' . $notification_url);
 

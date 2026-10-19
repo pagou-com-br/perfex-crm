@@ -4,7 +4,7 @@ defined('BASEPATH') or exit('No direct script access allowed');
 /*
 Module Name: Pagou Integração Perfex CRM
 Description: Gateway de pagamento www.pagou.com.br, PIX & Boleto para Perfex CRM
-Version: 1.2.1
+Version: 2.0.0
 Requires at least: 3.2.0
 Author: Liquida SP
 Author URI: https://liquidasp.com.br/
@@ -53,6 +53,7 @@ hooks()->add_action('invoice_marked_as_cancelled', 'cancel_pagou_boleto');
 hooks()->add_action('after_invoice_added', 'pagou_auto_issue_boleto');
 hooks()->add_action('after_invoice_updated', 'pagou_auto_issue_boleto_on_update');
 hooks()->add_action('after_cron_run', 'process_pagou_boleto_invoices');
+hooks()->add_action('after_cron_run', 'pagou_reconcile_payments');
 
 hooks()->add_action('admin_init', function () {
     $CI = &get_instance();
@@ -234,50 +235,13 @@ function pagou_auto_issue_boleto_on_update($invoice_id)
 
 function pagou_update_boleto_info($transaction)
 {
-    $CI = &get_instance();
-    
     try {
-        require_once(__DIR__ . '/libraries/pagou/Api_client.php');
-        
-        $api_token = get_option('paymentmethod_pagou_boleto_api_token');
-        if (empty($api_token)) {
-            log_activity('Pagou: API Token não configurado.');
+        pagou_load_libraries();
+        if (!Pagou_schema::ready()) {
             return false;
         }
-        
-        $CI->load->library('encryption');
-        $api_token = $CI->encryption->decrypt($api_token);
-        
-        if (empty($api_token)) {
-            log_activity('Pagou: Não foi possível descriptografar o API Token.');
-            return false;
-        }
-        
-        $is_production = get_option('paymentmethod_pagou_boleto_is_production') === '1';
-        
-        $api_client = new Api_client($api_token, $is_production);
-        
-        $result = $api_client->getBoleto($transaction->transaction_id);
-        
-        if (!$result['success']) {
-            log_activity('Pagou: Falha ao consultar boleto na API: ' . $result['message']);
-            return false;
-        }
-        
-        $update_data = [
-            'status' => isset($result['data']->status) ? pagou_normalize_status($result['data']->status, 'boleto') : $transaction->status,
-            'updated_at' => date('Y-m-d H:i:s'),
-            'api_response' => json_encode($result['data'])
-        ];
-        
-        $CI->db->where('id', $transaction->id);
-        $CI->db->update(db_prefix() . 'pagou_transactions_boleto', $update_data);
-        
-        if (isset($result['data']->payload) && isset($result['data']->payload->qrcode_id)) {
-            pagou_save_pix_info_from_boleto($transaction->invoice_id, $result['data']);
-        }
-        
-        return true;
+        $events = new Pagou_events();
+        return $events->refresh_boleto($transaction) !== null;
     } catch (\Throwable $e) {
         log_activity('Pagou: Erro ao atualizar informações do boleto: ' . $e->getMessage());
         return false;
@@ -298,6 +262,12 @@ function pagou_save_pix_info_from_boleto($invoice_id, $boleto_data)
 function process_pagou_boleto_invoices()
 {
     $CI = &get_instance();
+
+    // Só depois da atualização do banco (migration 200), que protege as faturas existentes
+    pagou_load_libraries();
+    if (!Pagou_schema::ready()) {
+        return;
+    }
 
     // Só faturas abertas (1 não paga, 3 parcial, 4 vencida) ainda não processadas
     $CI->db->where("allowed_payment_modes LIKE '%\"pagou_boleto\"%' ");
@@ -322,5 +292,23 @@ function process_pagou_boleto_invoices()
             $CI->db->where('id', $invoice->id);
             $CI->db->update(db_prefix() . 'invoices', ['invoice_pagou' => $flag]);
         }
+    }
+}
+
+
+/**
+ * Reconciliação pelo cron: dá baixa em cobranças pagas cujo webhook não chegou.
+ */
+function pagou_reconcile_payments()
+{
+    try {
+        pagou_load_libraries();
+        if (!Pagou_schema::ready()) {
+            return;
+        }
+        $events = new Pagou_events();
+        $events->reconcile();
+    } catch (\Throwable $e) {
+        log_activity('Pagou: erro na reconciliação de pagamentos: ' . $e->getMessage());
     }
 }

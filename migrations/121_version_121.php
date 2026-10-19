@@ -19,7 +19,7 @@ class Migration_Version_121 extends App_module_migration
         // As faturas antigas continuam podendo gerar boleto quando o cliente abre a fatura.
         $invoices_table = db_prefix() . 'invoices';
         if ($CI->db->field_exists('invoice_pagou', $invoices_table)) {
-            $CI->db->query("UPDATE `{$invoices_table}` SET `invoice_pagou` = 1 WHERE `invoice_pagou` IS NULL OR `invoice_pagou` = 0");
+            $CI->db->query("UPDATE `{$invoices_table}` SET `invoice_pagou` = 1 WHERE (`invoice_pagou` IS NULL OR `invoice_pagou` = 0) AND `status` <> 6");
         }
     }
 }

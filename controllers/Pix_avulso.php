@@ -51,7 +51,7 @@ class Pix_avulso extends AdminController
                 'amount'          => $formatted_amount,
                 'description'     => 'Cobrança Avulsa: ' . $descricao,
                 'expiration'      => 86400, // 24 horas
-                'notification_url'=> site_url('pagou/notification'),
+                'notification_url'=> site_url('pagou/pagou_webhook/process'),
                 'payer'           => [
                     'name'     => $nome,
                     'document' => preg_replace('/\D/', '', $cpf)

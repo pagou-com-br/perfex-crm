@@ -274,6 +274,10 @@ if (!$CI->db->field_exists($invoice_column, $invoice_table)) {
     $CI->db->query("ALTER TABLE `$invoice_table` ADD COLUMN `$invoice_column` TINYINT(1) NOT NULL DEFAULT 0;");
 }
 
+// Esquema 2.0: eventos de webhook, colunas novas e proteção contra emissão em massa
+require_once __DIR__ . '/libraries/pagou/Pagou_schema.php';
+Pagou_schema::apply(false);
+
 /*
  * ============================
  * Adição de Campos Personalizados para Endereço

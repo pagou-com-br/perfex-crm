@@ -218,6 +218,11 @@ function get_customer_address_number($client_id)
  */
 function pagou_api_base_url($is_production)
 {
+    // Somente para testes automatizados contra um servidor simulado
+    if (defined('PAGOU_API_BASE_URL_OVERRIDE')) {
+        return PAGOU_API_BASE_URL_OVERRIDE;
+    }
+
     return $is_production ? 'https://api.pagou.com.br' : 'https://api.pagou.cloud';
 }
 
@@ -549,4 +554,162 @@ function pagou_save_linked_pix($invoice_id, $boleto_data)
     }
 
     return true;
+}
+
+/* ============================
+     2.0: registro de logs, carregamento das bibliotecas
+   ============================ */
+
+/**
+ * Carrega o cliente da API e o processador de eventos do módulo.
+ *
+ * @return void
+ */
+function pagou_load_libraries()
+{
+    require_once __DIR__ . '/../libraries/pagou/Pagou_api.php';
+    require_once __DIR__ . '/../libraries/pagou/Pagou_events.php';
+    require_once __DIR__ . '/../libraries/pagou/Pagou_schema.php';
+}
+
+/**
+ * Mascara dados sensíveis (documentos, dados bancários, chaves, tokens) antes de registrar.
+ *
+ * @param mixed $data
+ * @return mixed
+ */
+function pagou_redact($data)
+{
+    $sensitive = [
+        'document', 'doc', 'cpf', 'cnpj', 'account', 'agency', 'bank', 'x-api-key', 'api_key',
+        'api_token', 'card_token', 'cvv', 'number', 'email', 'phone', 'zip', 'street',
+        'qr_code', 'qr_code_img', 'image', 'data_url',
+    ];
+    if (is_object($data)) {
+        $data = json_decode(json_encode($data), true);
+    }
+    if (!is_array($data)) {
+        return $data;
+    }
+    foreach ($data as $key => $value) {
+        if (is_string($key) && in_array(strtolower($key), $sensitive, true)) {
+            $data[$key] = is_array($value) ? '[mascarado]' : (is_scalar($value) && $value !== '' ? '[mascarado]' : $value);
+        } elseif (is_array($value) || is_object($value)) {
+            $data[$key] = pagou_redact($value);
+        }
+    }
+
+    return $data;
+}
+
+/**
+ * Registra um log do módulo quando "pagou_logs_api" estiver ligado, sempre com dados mascarados.
+ *
+ * @param string $channel api, webhook, pix, boleto, cron
+ * @param string $level   debug, info, error
+ * @param string $message
+ * @param array  $context
+ * @return void
+ */
+function pagou_log($channel, $level, $message, array $context = [])
+{
+    if (get_option('pagou_logs_api') !== '1') {
+        return;
+    }
+    $line = '[' . date('Y-m-d H:i:s') . '] [Pagou ' . $channel . '] ' . $message;
+    if ($context) {
+        $line .= ' | ' . json_encode(pagou_redact($context), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    }
+    log_message($level === 'debug' ? 'debug' : ($level === 'error' ? 'error' : 'info'), $line);
+    @error_log($line . PHP_EOL, 3, APPPATH . 'logs/pagou_' . $channel . '_' . date('Y-m-d') . '.log');
+}
+
+/**
+ * Data/hora UTC no formato aceito pelos filtros de listagem (YYYY-MM-DDTHH:mm:ssZ).
+ *
+ * @param int $timestamp
+ * @return string
+ */
+function pagou_utc_filter_time($timestamp)
+{
+    return gmdate('Y-m-d\TH:i:s\Z', (int) $timestamp);
+}
+
+/**
+ * Data de vencimento aceita pela API: a da fatura, ou hoje (piso em UTC) se já passou.
+ *
+ * @param string|null $duedate
+ * @return string YYYY-MM-DD
+ */
+function pagou_effective_due_date($duedate)
+{
+    $today = max(date('Y-m-d'), gmdate('Y-m-d'));
+    if (!empty($duedate)) {
+        $due = date('Y-m-d', strtotime($duedate));
+        if ($due > $today) {
+            return $due;
+        }
+    }
+
+    return $today;
+}
+
+/**
+ * Valor ainda em aberto da fatura (respeita pagamentos parciais).
+ *
+ * @param object $invoice
+ * @return float
+ */
+function pagou_invoice_amount_due($invoice)
+{
+    if (function_exists('get_invoice_total_left_to_pay')) {
+        return round((float) get_invoice_total_left_to_pay($invoice->id, $invoice->total), 2);
+    }
+
+    return round((float) $invoice->total, 2);
+}
+
+/**
+ * Valida CPF ou CNPJ (somente dígitos).
+ *
+ * @param string $document
+ * @return bool
+ */
+function pagou_valid_document($document)
+{
+    $d = preg_replace('/\D/', '', (string) $document);
+    if (strlen($d) === 11) {
+        if (preg_match('/^(\d)\1{10}$/', $d)) {
+            return false;
+        }
+        for ($t = 9; $t < 11; $t++) {
+            $sum = 0;
+            for ($i = 0; $i < $t; $i++) {
+                $sum += (int) $d[$i] * (($t + 1) - $i);
+            }
+            if ((int) $d[$t] !== ((10 * $sum) % 11) % 10) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (strlen($d) === 14) {
+        if (preg_match('/^(\d)\1{13}$/', $d)) {
+            return false;
+        }
+        $weights = [[5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2], [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]];
+        foreach ([12, 13] as $k => $len) {
+            $sum = 0;
+            for ($i = 0; $i < $len; $i++) {
+                $sum += (int) $d[$i] * $weights[$k][$i];
+            }
+            $rest = $sum % 11;
+            if ((int) $d[$len] !== ($rest < 2 ? 0 : 11 - $rest)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    return false;
 }
