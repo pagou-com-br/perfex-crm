@@ -35,7 +35,7 @@ class Api_client
         $log_detailed_option = $CI->db->get_where(db_prefix() . 'options', ['name' => 'paymentmethod_pagou_boleto_log_detailed'])->row();
         $this->log_detailed = ($log_detailed_option && $log_detailed_option->value === '1');
 
-        $this->log('debug', 'Api_client inicializado. Token: ' . substr($api_token, 0, 4) . '..., Ambiente: ' . ($this->is_production ? 'Produção' : 'Sandbox'));
+        $this->log('debug', 'Api_client inicializado. Ambiente: ' . ($this->is_production ? 'Produção' : 'Sandbox'));
     }
 
     /**
@@ -80,9 +80,7 @@ class Api_client
      * @return string URL base da API
      */
     private function getApiBaseUrl() {
-        return $this->is_production 
-            ? 'https://api.pagou.com.br/v1'
-            : 'https://sandbox-api.pagou.com.br/v1';
+        return pagou_api_base_url($this->is_production) . '/v1';
     }
 
     /**
@@ -209,7 +207,6 @@ class Api_client
         curl_setopt($ch, CURLOPT_TIMEOUT, 60);
         
         // Configura para capturar informações da requisição
-        curl_setopt($ch, CURLINFO_HEADER_OUT, true);
         
         // Configura o método e payload conforme necessário
         switch ($method) {
@@ -242,7 +239,6 @@ class Api_client
         
         // Coleta informações sobre a requisição
         $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $request_headers = curl_getinfo($ch, CURLINFO_HEADER_OUT);
         $error = curl_error($ch);
         $error_code = curl_errno($ch);
         $time_taken = $end_time - $start_time;
@@ -254,7 +250,6 @@ class Api_client
             $this->log('debug', "Informações da requisição", [
                 'Método' => $method,
                 'URL' => $endpoint,
-                'Headers' => $headers,
                 'Payload' => $data,
                 'Resposta HTTP' => $http_code,
                 'Tempo' => $time_taken . 's',

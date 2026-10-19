@@ -19,6 +19,9 @@ class Pagou_conf extends AdminController
     public function __construct()
     {
         parent::__construct();
+        if (!is_admin()) {
+            access_denied('Pagou Configurações');
+        }
         $this->load->model('pagou_conf_model');
 
         // Recupera o status dos logs a partir da tabela tbloptions (campo value onde name = "pagou_logs_api")

@@ -4,7 +4,7 @@ defined('BASEPATH') or exit('No direct script access allowed');
 /*
 Module Name: Pagou Integração Perfex CRM
 Description: Gateway de pagamento www.pagou.com.br, PIX & Boleto para Perfex CRM
-Version: 1.2.0
+Version: 1.2.1
 Requires at least: 3.2.0
 Author: Liquida SP
 Author URI: https://liquidasp.com.br/
@@ -34,12 +34,14 @@ function pagou_module_permissions()
 }
 
 
-if ($CI->uri->segment(1) === 'pagou' && $CI->uri->segment(2) === 'webhook') {
-    require_once __DIR__ . '/controllers/Pagou.php';
-    $pagou = new Pagou();
-    $pagou->webhook();
-    exit;
-}
+// Webhooks não carregam token CSRF; a autenticação é feita pela assinatura HMAC
+hooks()->add_filter('csrf_exclude_uris', function ($uris) {
+    return array_merge((array) $uris, [
+        'admin/pagou/pagou_webhook/process.*',
+        'pagou/pagou_webhook/process.*',
+        'pagou/notification',
+    ]);
+});
 
 
 register_activation_hook('pagou', 'pagou_activation_hook');
@@ -54,7 +56,7 @@ hooks()->add_action('after_cron_run', 'process_pagou_boleto_invoices');
 hooks()->add_action('admin_init', function () {
     $CI = &get_instance();
 
-    if (has_permission('pagou', '', 'view')) {
+    if (staff_can('access_pix_avulso', 'pagou_module') || staff_can('access_reembolso', 'pagou_module')) {
         $CI->app_menu->add_sidebar_menu_item('pagou-menu', [
             'name' => 'Pagou',
             "icon" => "fa fa-usd",
@@ -110,10 +112,6 @@ function pagou_adicionar_rotas()
     $conteudo = file_get_contents($file_path);
 
     $rotas = [
-        "\$route['pagou_gateway/make_payment/(:num)/(:any)'] = 'pagou_gateway/make_payment/\$1/\$2';",
-        "\$route['pagou_gateway/pay'] = 'pagou_gateway/pay';",
-        "\$route['pagou_gateway/callback'] = 'pagou_gateway/callback';",
-        "\$route['pagou/webhook'] = 'pagou/webhook';",
         "\$route['pagou/notification'] = 'notification/index';",
         "\$route['pagou/check_payment/(:any)'] = 'pagou/check_payment/\$1';"
     ];
@@ -190,7 +188,7 @@ function pagou_auto_issue_boleto($invoice_id)
             log_activity('Pagou: Falha ao gerar boleto automaticamente para a fatura ID ' . $invoice_id);
             return false;
         }
-    } catch (Exception $e) {
+    } catch (\Throwable $e) {
         log_activity('Pagou: Erro ao gerar boleto automaticamente: ' . $e->getMessage());
         return false;
     }
@@ -262,7 +260,7 @@ function pagou_update_boleto_info($transaction)
         }
         
         return true;
-    } catch (Exception $e) {
+    } catch (\Throwable $e) {
         log_activity('Pagou: Erro ao atualizar informações do boleto: ' . $e->getMessage());
         return false;
     }
@@ -308,7 +306,7 @@ function pagou_save_pix_info_from_boleto($invoice_id, $boleto_data)
         }
         
         return true;
-    } catch (Exception $e) {
+    } catch (\Throwable $e) {
         log_activity('Pagou: Erro ao salvar informações de PIX do boleto: ' . $e->getMessage());
         return false;
     }

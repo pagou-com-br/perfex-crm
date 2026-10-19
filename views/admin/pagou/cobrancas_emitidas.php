@@ -114,7 +114,7 @@ log_message('info', 'Carregando a view "Cobranças PIX Emitidas".');
                                         <?php 
                                         $pagos = 0;
                                         foreach ($transactions_pix as $trans) {
-                                            if ($trans->status == 'paid' || $trans->status == '2') {
+                                            if ($trans->status == 'paid' || $trans->status == '4') {
                                                 $pagos++;
                                             }
                                         }
@@ -639,7 +639,7 @@ function refundTransaction(transactionId, clientName, invoiceNumber, amount) {
         let payload = {
             amount: refundAmount,
             description: reasonText,
-            reason: 1  // reason fixo = 1 (conforme documentação da API)
+            reason: 3  // 3 = devolução solicitada pelo cliente final
         };
 
         fetch(endpoint, {
@@ -656,7 +656,7 @@ function refundTransaction(transactionId, clientName, invoiceNumber, amount) {
                 $('#modalReembolsoPix').modal('hide');
                 
                 // Exibe mensagem de sucesso
-                alert('Reembolso PIX realizado com sucesso!');
+                alert(data.message || 'Estorno solicitado à Pagou.');
                 
                 // Recarrega apenas a tabela DataTable
                 var table = $('.table-pix').DataTable();
@@ -725,7 +725,7 @@ function viewTransactionDetails(transactionId) {
                 var status = response.transaction.status;
                 var statusHtml = '';
                 
-                if (status === 'paid' || status === '2') {
+                if (status === 'paid' || status === '4') {
                     statusHtml = '<span class="label label-success"><i class="fa fa-check-circle"></i> Pago</span>';
                 } else if (status === 'pending' || status === '1') {
                     statusHtml = '<span class="label label-warning"><i class="fa fa-clock-o"></i> Pendente</span>';

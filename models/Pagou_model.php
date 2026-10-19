@@ -76,7 +76,7 @@ class Pagou_model extends App_Model
             }
         } else {
             // Inclui 'refunded' como status padrão para mostrar
-            $this->db->where_in('pix.status', ['paid', '2', 'refunded']);
+            $this->db->where_in('pix.status', ['paid', '4', 'refund_requested', 'refunded']);
         }
 
         $this->db->order_by('pix.date_created', 'DESC');
@@ -124,7 +124,7 @@ class Pagou_model extends App_Model
                 $this->db->where('boleto.status', $filters['status']);
             }
         } else {
-            $this->db->where_in('boleto.status', ['paid', '2']);
+            $this->db->where_in('boleto.status', ['paid', '4', '8', '9']);
         }
 
         $this->db->order_by('boleto.date_created', 'DESC');

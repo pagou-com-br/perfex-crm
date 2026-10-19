@@ -6,6 +6,9 @@ class Pix_avulso extends AdminController
     public function __construct()
     {
         parent::__construct();
+        if (!staff_can('access_pix_avulso', 'pagou_module')) {
+            access_denied('PIX Avulso');
+        }
         // Carrega o model responsável pelas cobranças PIX avulsas
         $this->load->model('pagou/Pix_avulso_model');
         // Carrega a biblioteca do gateway Pagou para PIX
@@ -59,11 +62,8 @@ class Pix_avulso extends AdminController
             $gateway = new Pagou_pix_gateway();
             $gateway->log('debug', 'Processando cobrança PIX avulsa.');
             
-            // Seleciona o endpoint de acordo com o ambiente
-            $environment = $gateway->getSetting('environment');
-            $api_endpoint = ($environment == 'sandbox') 
-                ? 'https://api.pagou.com.br/v1/pix' 
-                : 'https://api.pagou.com.br/v1/pix';
+            // Endpoint do ambiente configurado no gateway Pix
+            $api_endpoint = pagou_gateway_api_base_url('pagou_pix') . '/v1/pix';
             $gateway->log('debug', 'API endpoint selecionado: ' . $api_endpoint);
 
             // Realiza a requisição cURL para emitir a cobrança
@@ -71,15 +71,18 @@ class Pix_avulso extends AdminController
             curl_setopt($ch, CURLOPT_POST, 1);
             curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payment_data));
             curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+            curl_setopt($ch, CURLOPT_FOLLOWLOCATION, false);
             curl_setopt($ch, CURLOPT_HTTPHEADER, [
                 'Content-Type: application/json',
+                'User-Agent: pagou-perfex/1.2.1',
                 'X-API-KEY: ' . $gateway->decryptSetting('api_token')
             ]);
 
             $gateway->log('debug', 'Iniciando requisição cURL para gerar cobrança PIX avulsa.');
             $response = curl_exec($ch);
             $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            $gateway->log('debug', 'Resposta cURL: ' . $response);
             $gateway->log('debug', 'Código HTTP: ' . $http_code);
             curl_close($ch);
 
@@ -120,7 +123,12 @@ class Pix_avulso extends AdminController
                 redirect(admin_url('pagou/pix_avulso'));
             } else {
                 $gateway->log('error', 'Erro ao emitir cobrança PIX avulsa. Código HTTP: ' . $http_code . '. Resposta: ' . $response);
-                set_alert('danger', _l('Erro ao emitir cobrança PIX. Por favor, tente novamente.'));
+                if ($http_code === 0 || $http_code >= 500) {
+                    // Resultado indeterminado: a cobrança pode ter sido criada na Pagou
+                    set_alert('warning', _l('A Pagou não confirmou a emissão. Antes de emitir de novo, confira no painel da Pagou se a cobrança já foi criada.'));
+                } else {
+                    set_alert('danger', _l('Erro ao emitir cobrança PIX. Confira os dados informados.'));
+                }
                 redirect(admin_url('pagou/pix_avulso'));
             }
         } else {

@@ -79,7 +79,7 @@ class Pagou_webhook extends CI_Controller {
                                      ($attributes['null'] ? " NULL" : " NOT NULL"));
                     
                     $this->log('info', "Campo '{$field}' adicionado com sucesso à tabela pagou_transactions_pix");
-                } catch (Exception $e) {
+                } catch (\Throwable $e) {
                     $this->log('error', "Erro ao adicionar campo '{$field}': " . $e->getMessage());
                 }
             }
@@ -130,420 +130,201 @@ class Pagou_webhook extends CI_Controller {
     
     /**
      * Método principal que processa os webhooks da Pagou.com.br
-     * 
-     * @param int $invoice_id ID da fatura no Perfex CRM (opcional)
+     *
+     * O parâmetro da URL é aceito apenas por compatibilidade com notification_url antigas
+     * e nunca é usado para localizar faturas.
+     *
      * @return void
      */
-    public function process($invoice_id = null) {
+    public function process($ignored = null) {
         try {
-            // Define o timezone
-            date_default_timezone_set('America/Sao_Paulo');
-            
-            $this->log('debug', '====== INÍCIO DO PROCESSAMENTO DO WEBHOOK ======');
-            $this->log('debug', 'Webhook Pagou acionado. Invoice ID (URL): ' . ($invoice_id ?? 'N/A'));
-            
-            // Log dos cabeçalhos recebidos
-            $headers = $this->getRequestHeaders();
-            $this->log('debug', 'Headers recebidos:', $headers);
-            
-            // Obter dados brutos da requisição
+            // Corpo bruto: a assinatura é calculada sobre os bytes exatos recebidos
             $raw_data = file_get_contents('php://input');
-            $this->log('debug', 'Dados brutos recebidos:', $raw_data);
-            
-            // Se não tem dados, tenta pegar de $_POST
-            if (empty($raw_data) && !empty($_POST)) {
-                $this->log('debug', 'Tentando ler dados do $_POST:', $_POST);
-                $raw_data = json_encode($_POST);
-            }
-            
-            // Verifica se há dados no webhook
-            if (empty($raw_data)) {
-                $this->log('info', 'Nenhum dado recebido. Consultando API diretamente...');
-                
-                // Se temos invoice_id, consultamos a API Pagou diretamente
-                if ($invoice_id) {
-                    $this->verifyTransactionStatusFromApi($invoice_id);
-                    return;
-                }
-                
-                $this->safeResponse(400, "Nenhum dado recebido no webhook.");
+
+            if (!pagou_authenticate_webhook_request($raw_data)) {
+                $this->log('error', 'Webhook rejeitado: X-Pagou-Signature ausente ou inválida.');
+                $this->safeResponse(401, 'Assinatura inválida.');
                 return;
             }
 
-            // Decodifica os dados JSON
             $data = json_decode($raw_data, true);
-            if (json_last_error() !== JSON_ERROR_NONE) {
+            if (!is_array($data)) {
                 $this->log('error', 'Erro ao decodificar JSON: ' . json_last_error_msg());
-                $this->safeResponse(400, "Erro na decodificação dos dados JSON.");
+                $this->safeResponse(400, 'Erro na decodificação dos dados JSON.');
                 return;
             }
-            
-            // Processa os dados do webhook
-            $result = $this->processWebhookData($data, $invoice_id);
-            
+
+            $this->log('debug', '====== INÍCIO DO PROCESSAMENTO DO WEBHOOK ======', [
+                'name' => $data['name'] ?? null,
+                'id' => $data['data']['id'] ?? null,
+            ]);
+
+            $result = $this->processWebhookData($data);
+
             $this->log('debug', '====== FIM DO PROCESSAMENTO DO WEBHOOK ======');
             $this->safeResponse($result['code'], $result['message']);
-            
-        } catch (Exception $e) {
-            // Registra exceção no log
+
+        } catch (\Throwable $e) {
             $this->log('error', 'Exceção não tratada:', [
                 'message' => $e->getMessage(),
                 'file' => $e->getFile(),
-                'line' => $e->getLine(),
-                'trace' => $e->getTraceAsString()
+                'line' => $e->getLine()
             ]);
-            
-            // Retorna resposta de sucesso para evitar retentativas
-            $this->safeResponse(200, "Webhook processado, mas ocorreram erros internos.");
+
+            // 5xx faz a Pagou reenviar o evento
+            $this->safeResponse(500, 'Erro interno ao processar o webhook.');
         }
     }
-    
+
     /**
-     * Processa os dados recebidos no webhook
-     * 
+     * Processa os dados recebidos no webhook (já autenticado)
+     *
      * @param array $data Dados decodificados do webhook
-     * @param int $invoice_id ID da fatura (opcional)
      * @return array Resultado do processamento
      */
-    private function processWebhookData($data, $invoice_id = null) {
-        // Determina o tipo de evento e pagamento
+    private function processWebhookData($data) {
         $event_name = $data['name'] ?? null;
+        $event_data = (isset($data['data']) && is_array($data['data'])) ? $data['data'] : [];
+
         $is_pix_payment = ($event_name === 'qrcode.completed');
         $is_pix_refund = ($event_name === 'qrcode.refunded');
-        $is_boleto_payment = ($event_name === 'charge.completed' || $event_name === 'charge.paid');
-        
-        // Log do tipo de evento recebido
-        $this->log('info', "Processando evento: {$event_name}, PIX payment: " . ($is_pix_payment ? 'Sim' : 'Não') . 
-                          ", PIX refund: " . ($is_pix_refund ? 'Sim' : 'Não') . 
-                          ", Boleto payment: " . ($is_boleto_payment ? 'Sim' : 'Não'));
-        
-        // Extrai os dados principais - Suporta estrutura aninhada
-        $event_data = $data['data'] ?? $data;
-        
-        $pagou_transaction_id = $event_data['id'] ?? null;
-        $external_id_from_webhook = $event_data['external_id'] ?? $event_data['client_code'] ?? null;
-        $transaction_id_secondary = $event_data['transaction_id'] ?? null; // ID secundário da transação
-        
-        // Define o status com base no tipo de evento
-        $new_status = $event_data['status'] ?? null;
-        if ($is_pix_payment && !$new_status) {
-            $new_status = 'paid';
-        } elseif ($is_pix_refund && !$new_status) {
-            $new_status = 'refunded';
-        } elseif ($is_boleto_payment && !$new_status) {
-            $new_status = 'paid';
+        $is_boleto_payment = ($event_name === 'charge.paid');
+
+        if ($event_name === 'charge.created') {
+            // Registro do boleto: não é pagamento
+            return ['code' => 200, 'message' => 'Registro de boleto recebido.'];
         }
-        
-        // Dados adicionais
-        $paid_at = $event_data['paid_at'] ?? $event_data['completed_at'] ?? date('Y-m-d H:i:s');
-        $refunded_at = $event_data['refunded_at'] ?? ($is_pix_refund ? date('Y-m-d H:i:s') : null);
-        $amount_from_webhook = $event_data['amount_paid'] ?? $event_data['amount'] ?? null;
-        
-        // Extrair informações do pagador
+
+        if (!$is_pix_payment && !$is_pix_refund && !$is_boleto_payment) {
+            $this->log('info', "Evento ignorado: {$event_name}");
+            return ['code' => 200, 'message' => 'Evento ignorado.'];
+        }
+
+        $pagou_transaction_id = $event_data['id'] ?? null;
+        if (!$pagou_transaction_id || !is_string($pagou_transaction_id)) {
+            $this->log('error', 'ID da cobrança ausente.');
+            return ['code' => 400, 'message' => 'Dados incompletos (ID da cobrança não fornecido).'];
+        }
+
+        $payment_type = $is_boleto_payment ? 'boleto' : 'pix';
+        $amount_from_webhook = pagou_event_amount($event_data);
         $payer_info = $event_data['payer'] ?? null;
-        
-        $this->log('info', "Dados extraídos:", [
+        $event_paid_at = $event_data['paid_at'] ?? null;
+
+        $this->log('info', 'Dados extraídos:', [
             'event_name' => $event_name,
             'transaction_id' => $pagou_transaction_id,
-            'transaction_id_secondary' => $transaction_id_secondary,
-            'external_id' => $external_id_from_webhook,
-            'new_status' => $new_status,
-            'paid_at' => $paid_at,
-            'refunded_at' => $refunded_at,
+            'event_transaction_id' => $event_data['transaction_id'] ?? null,
             'amount' => $amount_from_webhook,
-            'payer' => $payer_info
         ]);
-        
-        // Validações básicas - para eventos de reembolso, apenas o ID da transação é obrigatório
-        if (!$pagou_transaction_id) {
-            $this->log('error', 'ID da transação ausente.');
-            return [
-                'code' => 400,
-                'message' => "Dados incompletos (ID da transação não fornecido)."
-            ];
-        }
-        
-        // Para eventos que não são de reembolso, o status também é obrigatório
-        if (!$is_pix_refund && !$new_status) {
-            $this->log('error', 'Status ausente para evento não-reembolso.');
-            return [
-                'code' => 400,
-                'message' => "Dados incompletos (status não fornecido para evento não-reembolso)."
-            ];
-        }
 
-        // Determina o tipo de pagamento (PIX ou Boleto)
-        $payment_type = ($is_pix_payment || $is_pix_refund) ? 'pix' : 'boleto';
-        
-        // Busca a transação no banco de dados - tentativa com ID primário
-        $transaction = $this->findTransaction($pagou_transaction_id, $external_id_from_webhook, $invoice_id, $payment_type);
-        
-        // Se não encontrou com ID primário, tenta com ID secundário caso exista
-        if (!$transaction && $transaction_id_secondary) {
-            $this->log('info', "Transação não encontrada com ID primário, tentando com ID secundário: {$transaction_id_secondary}");
-            $transaction = $this->findTransactionBySecondary($transaction_id_secondary, $payment_type);
-        }
-
-        // Se ainda não encontrou a transação, tenta criar um novo registro
+        // Só processa cobranças criadas por este módulo
+        $transaction = $this->findTransaction($pagou_transaction_id, $payment_type);
         if (!$transaction) {
-            $this->log('warning', "Transação não encontrada localmente para ID: {$pagou_transaction_id}");
-            
-            // Se temos invoice_id ou external_id, podemos tentar criar um novo registro
-            if ($invoice_id || $external_id_from_webhook) {
-                $invoice_to_use = $invoice_id ?: $this->getInvoiceIdFromExternalId($external_id_from_webhook);
-                
-                if ($invoice_to_use) {
-                    $this->log('info', "Tentando criar/processar transação para fatura ID: {$invoice_to_use}");
-                    
-                    // Para eventos de PIX, podemos criar uma nova transação
-                    if ($is_pix_payment || $is_pix_refund) {
-                        $transaction = $this->createNewTransaction(
-                            $pagou_transaction_id,
-                            $invoice_to_use,
-                            $external_id_from_webhook,
-                            $payment_type,
-                            $amount_from_webhook,
-                            $new_status,
-                            $paid_at,
-                            $transaction_id_secondary
-                        );
-                        
-                        if ($transaction) {
-                            $this->log('info', "Nova transação criada para ID: {$pagou_transaction_id}, Fatura: {$invoice_to_use}");
-                            
-                            // Agora podemos prosseguir com o processamento normal
-                        } else {
-                            $this->log('error', "Falha ao criar nova transação para ID: {$pagou_transaction_id}");
-                            return [
-                                'code' => 500,
-                                'message' => "Erro ao criar registro de transação."
-                            ];
-                        }
-                    }
-                    // Para outros tipos de eventos, tentamos o processamento direto
-                    else {
-                        $result = $this->processDirectPayment(
-                            $invoice_to_use, 
-                            $pagou_transaction_id, 
-                            $new_status, 
-                            $paid_at, 
-                            $amount_from_webhook,
-                            $payer_info,
-                            $payment_type
-                        );
-                        
-                        if ($result) {
-                            // Adiciona script para atualizar a página da fatura no navegador
-                            $this->sendRefreshCommand($invoice_to_use);
-                            
-                            return [
-                                'code' => 200,
-                                'message' => "Pagamento processado diretamente para a fatura ID: {$invoice_to_use}."
-                            ];
-                        }
-                    }
-                } else {
-                    // Não conseguimos identificar a fatura
-                    $this->log('error', "Não foi possível identificar a fatura para a transação: {$pagou_transaction_id}");
-                    return [
-                        'code' => 200, // Ainda retorna 200 para evitar retentativas
-                        'message' => "Transação recebida, mas fatura não identificada."
-                    ];
-                }
-            }
-            
-            // Se ainda não temos a transação neste ponto, retornamos um erro
-            if (!$transaction) {
-                return [
-                    'code' => 200, // Retorna 200 para evitar retentativas
-                    'message' => "Transação não encontrada localmente, mas webhook recebido."
-                ];
-            }
+            $this->log('warning', "Cobrança {$pagou_transaction_id} não pertence a este Perfex. Evento ignorado.");
+            return ['code' => 200, 'message' => 'Cobrança desconhecida. Evento ignorado.'];
         }
 
-        // Tratamento específico para reembolsos
         if ($is_pix_refund) {
-            $this->log('info', "Processando evento de reembolso para transação ID: {$pagou_transaction_id}");
-            
-            // Define campos para atualização
-            $update_data = [
-                'status' => 'refunded',
-                'payment_method' => 'pix',
-                'data_estorno' => $refunded_at ?: date('Y-m-d H:i:s')
-            ];
-            
-            // Atualiza o log de reembolso
-            $this->pagou_model->add_refund_log($pagou_transaction_id, [
-                'action' => 'refund_webhook',
-                'amount' => $amount_from_webhook,
-                'webhook_data' => $data
-            ]);
-            
-            // Atualiza a transação com os dados do reembolso
-            $updated = $this->updateTransaction($transaction, 'refunded', $paid_at, $refunded_at, $amount_from_webhook, $data, $payment_type);
-            
-            if ($updated) {
-                $this->log('info', "Status da transação atualizado para 'refunded' com sucesso.");
-                
-                // Atualiza a fatura -> status=5 (Cancelado)
-                $this->db->where('id', $transaction->invoice_id);
-                $this->db->update(db_prefix() . 'invoices', ['status' => 5]);
-                $this->log('info', "Fatura ID {$transaction->invoice_id} atualizada para status=5 (Cancelado).");
-                
-                // Envia comando para atualizar a página da fatura
-                $this->sendRefreshCommand($transaction->invoice_id);
-                
-                return [
-                    'code' => 200,
-                    'message' => "Reembolso processado com sucesso para transação ID: {$pagou_transaction_id}"
-                ];
-            } else {
-                $this->log('error', "Falha ao atualizar status para 'refunded'");
-                return [
-                    'code' => 500,
-                    'message' => "Erro ao atualizar status para reembolso."
-                ];
-            }
+            return $this->processRefundEvent($transaction, $pagou_transaction_id, $amount_from_webhook, $data);
         }
 
-        // Para eventos de pagamento, atualiza a transação com os dados recebidos
-        $updated = $this->updateTransaction($transaction, $new_status, $paid_at, $refunded_at, $amount_from_webhook, $data, $payment_type);
-        
+        // Evento de pagamento atrasado não reabre uma cobrança já estornada
+        if ($transaction->status === 'refunded') {
+            $this->log('info', "Cobrança {$pagou_transaction_id} já estornada. Evento de pagamento ignorado.");
+            return ['code' => 200, 'message' => 'Cobrança já estornada. Evento ignorado.'];
+        }
+
+        // Confirma na API antes de dar baixa
+        $api_data = $this->getPagouTransactionData($pagou_transaction_id, $payment_type);
+        if (!$api_data) {
+            return ['code' => 503, 'message' => 'Não foi possível confirmar o pagamento na API. Reenvie depois.'];
+        }
+
+        $api_status = isset($api_data->status) ? (int) $api_data->status : null;
+        $paid_statuses = ($payment_type === 'pix') ? [4] : [4, 8, 9];
+        if (!in_array($api_status, $paid_statuses, true)) {
+            $this->log('warning', 'Pagamento não confirmado pela API. Status: ' . var_export($api_status, true));
+            $this->updateTransaction($transaction, $api_status, null, null, null, $data, $payment_type);
+            return ['code' => 200, 'message' => 'Pagamento ainda não confirmado pela API.'];
+        }
+
+        $paid_at = $api_data->paid_at ?? $event_paid_at ?? date('Y-m-d H:i:s');
+        if ($amount_from_webhook === null && isset($api_data->amount) && is_numeric($api_data->amount)) {
+            $amount_from_webhook = (float) $api_data->amount;
+        }
+
+        $updated = $this->updateTransaction($transaction, 'paid', $paid_at, null, $amount_from_webhook, $data, $payment_type);
         if (!$updated) {
-            return [
-                'code' => 500,
-                'message' => "Erro ao atualizar transação."
-            ];
+            return ['code' => 500, 'message' => 'Erro ao atualizar transação.'];
         }
 
-        // Verifica se o status é de pagamento confirmado
-        $confirmed_statuses = ['paid', 'confirmed', '4']; // Adicionado '4' conforme exemplo de API
-        
-        if (in_array(strtolower($new_status), $confirmed_statuses) || 
-            (is_numeric($new_status) && intval($new_status) === 4) || 
-            $is_pix_payment || 
-            $is_boleto_payment) {
-            
-            $this->log('info', "Status alterado para pagamento confirmado. Processando pagamento...");
-            
-            $payment_processed = $this->processPayment(
-                $transaction, 
-                $pagou_transaction_id, 
-                $new_status, 
-                $paid_at, 
-                $amount_from_webhook,
-                $payer_info,
-                $payment_type
-            );
-            
-            if ($payment_processed) {
-                // Envia comando para atualizar a página da fatura
-                $this->sendRefreshCommand($transaction->invoice_id);
-                
-                return [
-                    'code' => 200,
-                    'message' => "Pagamento processado com sucesso."
-                ];
-            }
-            
-            return [
-                'code' => 200, // Ainda retorna 200 para evitar retentativas
-                'message' => "Atualização de status recebida, mas houve problemas ao processar o pagamento."
-            ];
+        $payment_processed = $this->processPayment(
+            $transaction,
+            $pagou_transaction_id,
+            'paid',
+            $paid_at,
+            $amount_from_webhook,
+            $payer_info,
+            $payment_type
+        );
+
+        if (!$payment_processed) {
+            return ['code' => 500, 'message' => 'Erro ao registrar o pagamento na fatura.'];
         }
-        
-        return [
-            'code' => 200,
-            'message' => "Webhook processado com sucesso. Status atualizado para: {$new_status}."
-        ];
+
+        $this->sendRefreshCommand($transaction->invoice_id);
+
+        return ['code' => 200, 'message' => 'Pagamento processado com sucesso.'];
     }
-    
+
     /**
-     * Cria um novo registro de transação quando não encontrada
+     * Processa o evento qrcode.refunded (devolução Pix confirmada)
      *
-     * @param string $transaction_id ID da transação
-     * @param int $invoice_id ID da fatura
-     * @param string $external_id ID externo
-     * @param string $payment_type Tipo de pagamento
-     * @param float $amount Valor
-     * @param string $status Status
-     * @param string $paid_at Data de pagamento
-     * @param string $transaction_id_secondary ID secundário da transação
-     * @return object|null Objeto da transação criada ou null se falhar
+     * @param object $transaction Transação local
+     * @param string $pagou_transaction_id ID da cobrança na Pagou
+     * @param float|null $refunded_amount Valor devolvido (pode ser parcial)
+     * @param array $data Webhook completo
+     * @return array
      */
-    private function createNewTransaction($transaction_id, $invoice_id, $external_id, $payment_type, $amount, $status, $paid_at, $transaction_id_secondary = null) {
-        try {
-            $table = db_prefix() . 'pagou_transactions_' . $payment_type;
-            
-            // Preparar dados para inserção
-            $data = [
-                'transaction_id' => $transaction_id,
-                'invoice_id' => $invoice_id,
-                'external_id' => $external_id,
-                'payment_method' => $payment_type,
-                'status' => $status,
-                'amount_final' => $amount,
-                'date_created' => date('Y-m-d H:i:s'),
-                'webhook_log' => json_encode([
-                    'created_at' => date('Y-m-d H:i:s'),
-                    'transaction_id' => $transaction_id,
-                    'transaction_id_secondary' => $transaction_id_secondary,
-                    'status' => $status,
-                    'amount' => $amount
-                ])
-            ];
-            
-            // Se for um pagamento e tiver data de pagamento
-            if ($status === 'paid' && $paid_at) {
-                $data['data_pagamento'] = date('Y-m-d H:i:s', strtotime($paid_at));
-            }
-            
-            // Insere os dados na tabela
-            $this->db->insert($table, $data);
-            
-            if ($this->db->affected_rows() > 0) {
-                // Busca a transação que acabamos de criar
-                $this->db->where('transaction_id', $transaction_id);
-                $transaction = $this->db->get($table)->row();
-                
-                return $transaction;
-            }
-            
-            return null;
-        } catch (Exception $e) {
-            $this->log('error', "Erro ao criar nova transação: " . $e->getMessage());
-            return null;
+    private function processRefundEvent($transaction, $pagou_transaction_id, $refunded_amount, $data) {
+        $this->log('info', "Processando devolução da cobrança {$pagou_transaction_id}");
+
+        $this->pagou_model->add_refund_log($pagou_transaction_id, [
+            'action' => 'refund_webhook',
+            'amount' => $refunded_amount,
+            'transaction_id' => $data['data']['transaction_id'] ?? null,
+        ]);
+
+        // Não altera a data de pagamento nem o valor pago
+        $refunded_at = date('Y-m-d H:i:s');
+        if (!$this->updateTransaction($transaction, 'refunded', null, $refunded_at, null, $data, 'pix')) {
+            return ['code' => 500, 'message' => 'Erro ao atualizar status para reembolso.'];
         }
+
+        $paid_amount = (float) $transaction->amount_final;
+        $is_full_refund = ($refunded_amount === null) || ($paid_amount > 0 && $refunded_amount + 0.009 >= $paid_amount);
+
+        if ($is_full_refund) {
+            $this->db->where('id', $transaction->invoice_id);
+            $this->db->update(db_prefix() . 'invoices', ['status' => 5]);
+            $this->log('info', "Fatura ID {$transaction->invoice_id} cancelada após devolução integral.");
+        } elseif ($this->db->table_exists(db_prefix() . 'invoiceactivity')) {
+            $this->db->insert(db_prefix() . 'invoiceactivity', [
+                'invoiceid' => $transaction->invoice_id,
+                'description' => 'Devolução Pix parcial de R$ ' . number_format($refunded_amount, 2, ',', '.') .
+                                 ' confirmada pela Pagou. Ajuste o pagamento da fatura manualmente.',
+                'additional_data' => serialize([]),
+                'staffid' => 0,
+                'date' => date('Y-m-d H:i:s')
+            ]);
+        }
+
+        $this->sendRefreshCommand($transaction->invoice_id);
+
+        return ['code' => 200, 'message' => 'Reembolso processado com sucesso.'];
     }
-    
-    /**
-     * Busca o ID da fatura usando o ID externo
-     *
-     * @param string $external_id ID externo
-     * @return int|null ID da fatura ou null se não encontrado
-     */
-    private function getInvoiceIdFromExternalId($external_id) {
-        if (!$external_id) {
-            return null;
-        }
-        
-        // Tenta extrair o ID da fatura do ID externo formatado
-        $pattern = '/([0-9]+)$/'; // Busca número no final da string
-        if (preg_match($pattern, $external_id, $matches)) {
-            $possible_invoice_id = $matches[1];
-            
-            // Verifica se a fatura existe
-            $this->db->where('id', $possible_invoice_id);
-            $invoice = $this->db->get(db_prefix() . 'invoices')->row();
-            
-            if ($invoice) {
-                return $invoice->id;
-            }
-        }
-        
-        return null;
-    }
-    
+
     /**
      * Envia comando para atualizar a página da fatura no navegador
      * 
@@ -568,78 +349,17 @@ class Pagou_webhook extends CI_Controller {
     }
     
     /**
-     * Encontra uma transação no banco de dados
-     * 
-     * @param string $pagou_transaction_id ID da transação na Pagou
-     * @param string $external_id ID externo da fatura
-     * @param int $invoice_id ID da fatura
+     * Encontra a transação local pelo ID da cobrança na Pagou
+     *
+     * @param string $pagou_transaction_id ID da cobrança na Pagou
      * @param string $payment_type Tipo de pagamento ('pix' ou 'boleto')
      * @return object|null Transação ou null se não encontrada
      */
-    private function findTransaction($pagou_transaction_id, $external_id = null, $invoice_id = null, $payment_type = 'pix') {
-        $table_name = db_prefix() . 'pagou_transactions_' . $payment_type;
-        
-        // Sempre tentamos encontrar pelo transaction_id primeiro
+    private function findTransaction($pagou_transaction_id, $payment_type = 'pix') {
         $this->db->where('transaction_id', $pagou_transaction_id);
-        $transaction = $this->db->get($table_name)->row();
-        
-        if ($transaction) {
-            return $transaction;
-        }
-        
-        // Não encontramos pelo transaction_id, vamos tentar por invoice_id e external_id
-        $this->db->reset_query();
-        
-        if ($invoice_id) {
-            $this->db->where('invoice_id', $invoice_id);
-            $transaction = $this->db->get($table_name)->row();
-            
-            if ($transaction) {
-                $this->log('info', "Transação encontrada por invoice_id: {$invoice_id}");
-                return $transaction;
-            }
-        }
-        
-        if ($external_id) {
-            $this->db->reset_query();
-            $this->db->where('external_id', $external_id);
-            $transaction = $this->db->get($table_name)->row();
-            
-            if ($transaction) {
-                $this->log('info', "Transação encontrada por external_id: {$external_id}");
-                return $transaction;
-            }
-        }
-        
-        return null;
+        return $this->db->get(db_prefix() . 'pagou_transactions_' . $payment_type)->row();
     }
-    
-    /**
-     * Busca uma transação pelo ID secundário (transaction_id no webhook)
-     *
-     * @param string $transaction_id_secondary ID secundário da transação
-     * @param string $payment_type Tipo de pagamento
-     * @return object|null Transação ou null se não encontrada
-     */
-    private function findTransactionBySecondary($transaction_id_secondary, $payment_type = 'pix') {
-        if (!$transaction_id_secondary) {
-            return null;
-        }
-        
-        $table_name = db_prefix() . 'pagou_transactions_' . $payment_type;
-        
-        // Tenta buscar na coluna webhook_log
-        $this->db->like('webhook_log', $transaction_id_secondary);
-        $transaction = $this->db->get($table_name)->row();
-        
-        if ($transaction) {
-            $this->log('info', "Transação encontrada por transaction_id_secondary: {$transaction_id_secondary}");
-            return $transaction;
-        }
-        
-        return null;
-    }
-    
+
 /**
  * Atualiza os dados da transação
  * 
@@ -665,26 +385,9 @@ private function updateTransaction($transaction, $new_status, $paid_at = null, $
         // Normalização do status para as tabelas de transações
         $original_status = $new_status;
         
-        // Status pagos (confirmados) - normalizar para "paid"
-        $paid_statuses = ['paid', 'confirmed', '2', '4', 2, 4];
-        if (in_array($new_status, $paid_statuses, true)) {
-            $new_status = 'paid';
-            $this->log('debug', "Status convertido: '{$original_status}' → 'paid'");
-        }
-        
-        // Status em processamento - normalizar para "processing" se necessário
-        $processing_statuses = ['processing', '3', 3];
-        if (in_array($new_status, $processing_statuses, true)) {
-            $new_status = 'processing';
-            $this->log('debug', "Status convertido: '{$original_status}' → 'processing'");
-        }
-        
-        // Status reembolsados - normalizar para "refunded"
-        $refunded_statuses = ['refunded', 'refund', 'estornado', 'estorno'];
-        if (in_array(strtolower($new_status), $refunded_statuses, true)) {
-            $new_status = 'refunded';
-            $this->log('debug', "Status convertido: '{$original_status}' → 'refunded'");
-        }
+        // Estados numéricos da API viram o vocabulário local (ver pagou_normalize_status)
+        $new_status = pagou_normalize_status($new_status, $payment_type);
+        $this->log('debug', "Status convertido: '{$original_status}' → '{$new_status}'");
 
         // Prepara dados para atualização
         $update_data = [
@@ -730,239 +433,56 @@ private function updateTransaction($transaction, $new_status, $paid_at = null, $
             $this->log('error', "Erro SQL ao atualizar transação: " . $error['message']);
             return false;
         }
-    } catch (Exception $e) {
+    } catch (\Throwable $e) {
         $this->log('error', "Erro ao atualizar transação {$payment_type}: " . $e->getMessage());
         return false;
     }
 }
     /**
-     * Consulta o status da transação diretamente na API
-     * 
-     * @param int $invoice_id ID da fatura
-     * @return void
+     * Obtém os dados da cobrança na API da Pagou
+     *
+     * @param string $transaction_id ID da cobrança
+     * @param string $payment_type 'pix' ou 'boleto'
+     * @return object|null Dados da cobrança ou null em caso de erro
      */
-    private function verifyTransactionStatusFromApi($invoice_id) {
-        $this->log('info', "=== VERIFICANDO STATUS VIA API ===", $invoice_id);
-        
-        try {
-            // Busca a transação PIX primeiro
-            $this->db->where('invoice_id', $invoice_id);
-            $this->db->order_by('id', 'desc');
-            $transaction_pix = $this->db->get(db_prefix() . 'pagou_transactions_pix')->row();
-            
-            // Se não encontrou PIX, busca transação de boleto
-            if (!$transaction_pix) {
-                $this->db->where('invoice_id', $invoice_id);
-                $this->db->order_by('id', 'desc');
-                $transaction_boleto = $this->db->get(db_prefix() . 'pagou_transactions_boleto')->row();
-                
-                if (!$transaction_boleto) {
-                    $this->log('error', "Nenhuma transação encontrada para a fatura {$invoice_id}");
-                    $this->safeResponse(404, "Nenhuma transação encontrada para esta fatura.");
-                    return;
-                }
-                
-                $transaction = $transaction_boleto;
-                $payment_type = 'boleto';
-            } else {
-                $transaction = $transaction_pix;
-                $payment_type = 'pix';
-            }
-            
-            $pagou_transaction_id = $transaction->transaction_id;
-            $this->log('info', "Consultando status da transação {$pagou_transaction_id} ({$payment_type}) na API");
-            
-            // Consulta a API com o endpoint correto baseado no tipo de pagamento
-            $api_endpoint = ($payment_type === 'pix') ? '/v1/pix/' : '/v1/charges/';
-            $api_data = $this->getPagouTransactionData($pagou_transaction_id, $api_endpoint);
-            
-            if (!$api_data) {
-                $this->log('error', "Falha ao consultar API para transação {$pagou_transaction_id}");
-                $this->safeResponse(500, "Erro ao consultar API da Pagou.");
-                return;
-            }
-            
-            $this->log('debug', "Resposta da API:", $api_data);
-            
-            // Verifica o status retornado
-            $api_status = $api_data->status ?? null;
-            $paid_at = $api_data->paid_at ?? null;
-            $amount = $api_data->amount ?? null;
-            $payer_info = $api_data->payer ?? null;
-            
-            if ($api_status === null) {
-                $this->log('error', "Status não encontrado na resposta da API");
-                $this->safeResponse(500, "Status não encontrado na resposta da API.");
-                return;
-            }
-            
-            $this->log('info', "Status na API: {$api_status}");
-            
-            // Atualiza o status da transação local
-            $update_data = [
-                'status' => $api_status,
-                'payment_method' => $payment_type,
-                'webhook_log' => ($transaction->webhook_log ? $transaction->webhook_log . "\n---\n" : '') . 
-                                date('Y-m-d H:i:s') . ":\n[VERIFICAÇÃO API] Status: {$api_status}" .
-                                ($paid_at ? ", Pago em: {$paid_at}" : "") .
-                                ($amount ? ", Valor: {$amount}" : "")
-            ];
-            
-            // Campo específico para data de pagamento baseado no tipo
-            if ($paid_at) {
-                if ($payment_type === 'pix') {
-                    $update_data['data_pagamento'] = date('Y-m-d H:i:s', strtotime($paid_at));
-                } else {
-                    $update_data['payment_date'] = date('Y-m-d H:i:s', strtotime($paid_at));
-                }
-            }
-            
-            if ($amount !== null) {
-                $update_data['amount_final'] = $amount;
-            }
-            
-            $this->db->where('id', $transaction->id);
-            $this->db->update(db_prefix() . 'pagou_transactions_' . $payment_type, $update_data);
-            
-            // Lista de status que indicam pagamento confirmado
-            $confirmed_statuses = ['paid', 'confirmed', '4'];
-            
-            // Verifica se o status é de pagamento confirmado
-            if (in_array(strtolower($api_status), $confirmed_statuses) || (is_numeric($api_status) && intval($api_status) === 4)) {
-                $this->log('info', "Pagamento confirmado pela API. Processando pagamento...");
-                
-                $payment_processed = $this->processPayment(
-                    $transaction, 
-                    $pagou_transaction_id, 
-                    $api_status, 
-                    $paid_at, 
-                    $amount,
-                    $payer_info,
-                    $payment_type
-                );
-                
-                if ($payment_processed) {
-                    // Envia comando para atualizar a página da fatura
-                    $this->sendRefreshCommand($invoice_id);
-                }
-                
-                $this->safeResponse(200, $payment_processed ? 
-                    "Pagamento confirmado pela API e processado com sucesso." : 
-                    "Pagamento confirmado pela API, mas houve um erro ao processar."
-                );
-            } else {
-                $this->log('info', "Pagamento não confirmado pela API. Status: {$api_status}");
-                $this->safeResponse(200, "Verificação realizada. Pagamento ainda não confirmado.");
-            }
-            
-        } catch (Exception $e) {
-            $this->log('error', "Erro na verificação via API:", [
-                'message' => $e->getMessage(),
-                'file' => $e->getFile(),
-                'line' => $e->getLine()
-            ]);
-            $this->safeResponse(500, "Erro ao verificar status do pagamento.");
-        }
-    }
-    
-    /**
-     * Obtém dados da transação na API da Pagou
-     * 
-     * @param string $transaction_id ID da transação
-     * @param string $api_endpoint Endpoint base da API ('/v1/pix/' ou '/v1/charges/')
-     * @return object|null Dados da transação ou null em caso de erro
-     */
-    private function getPagouTransactionData($transaction_id, $api_endpoint = '/v1/pix/') {
-        $this->log('debug', "Consultando API para transação:", $transaction_id);
-        
-        // Obtém o token da API
-        $api_token = $this->getApiToken();
+    private function getPagouTransactionData($transaction_id, $payment_type = 'pix') {
+        $gateway_id = ($payment_type === 'pix') ? 'pagou_pix' : 'pagou_boleto';
+        $api_token = pagou_gateway_api_token($gateway_id);
         if (!$api_token) {
-            $this->log('error', "Token da API não encontrado");
+            $this->log('error', "Chave da API não configurada no gateway {$gateway_id}");
             return null;
         }
-        
-        // Endpoint da API - determina o ambiente (produção ou sandbox)
-        $option = $this->db->get_where(db_prefix() . 'options', ['name' => 'paymentmethod_pagou_pix_is_production'])->row();
-        $is_production = ($option && $option->value === '1');
-        $api_base = $is_production ? 'https://api.pagou.com.br' : 'https://sandbox-api.pagou.com.br';
-        $api_url = $api_base . $api_endpoint . $transaction_id;
-        
-        try {
-            $ch = curl_init($api_url);
-            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($ch, CURLOPT_HTTPHEADER, [
-                'Content-Type: application/json',
-                'X-API-KEY: ' . $api_token
-            ]);
-            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 30);
-            curl_setopt($ch, CURLOPT_TIMEOUT, 60);
-            curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
-            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
-            
-            $response_body = curl_exec($ch);
-            $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            $curl_error = curl_error($ch);
-            
-            curl_close($ch);
-            
-            $this->log('debug', "Resposta HTTP: {$http_code}");
-            
-            if ($curl_error) {
-                $this->log('error', "Erro cURL: " . $curl_error);
-                return null;
-            }
-            
-            if ($http_code !== 200) {
-                $this->log('error', "Erro HTTP: {$http_code}");
-                return null;
-            }
-            
-            // Decodifica a resposta JSON
-            $data = json_decode($response_body);
-            if (json_last_error() !== JSON_ERROR_NONE) {
-                $this->log('error', "Erro ao decodificar JSON: " . json_last_error_msg());
-                return null;
-            }
-            
-            return $data;
-            
-        } catch (Exception $e) {
-            $this->log('error', "Exceção ao consultar API: " . $e->getMessage());
+
+        $api_endpoint = ($payment_type === 'pix') ? '/v1/pix/' : '/v1/charges/';
+        $api_url = pagou_gateway_api_base_url($gateway_id) . $api_endpoint . rawurlencode($transaction_id);
+
+        $ch = curl_init($api_url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Accept: application/json',
+            'User-Agent: pagou-perfex/1.2.1',
+            'X-API-KEY: ' . $api_token
+        ]);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 20);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
+
+        $response_body = curl_exec($ch);
+        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curl_error = curl_error($ch);
+        curl_close($ch);
+
+        if ($curl_error || $http_code !== 200) {
+            $this->log('error', "Falha ao consultar a cobrança {$transaction_id}: HTTP {$http_code} {$curl_error}");
             return null;
         }
+
+        $data = json_decode($response_body);
+        return is_object($data) ? $data : null;
     }
-    
-    /**
-     * Obtém o token da API das configurações
-     * 
-     * @return string|null Token da API ou null se não encontrado
-     */
-    private function getApiToken() {
-        $this->load->library('encryption');
-        
-        // Tenta obter o token do PIX primeiro
-        $token_option = $this->db->get_where(db_prefix() . 'options', ['name' => 'paymentmethod_pagou_pix_api_token'])->row();
-        
-        // Se não encontrou, tenta obter o token do boleto
-        if (!$token_option || empty($token_option->value)) {
-            $token_option = $this->db->get_where(db_prefix() . 'options', ['name' => 'paymentmethod_pagou_boleto_api_token'])->row();
-        }
-        
-        if ($token_option && !empty($token_option->value)) {
-            try {
-                $token = $this->encryption->decrypt($token_option->value);
-                return $token;
-            } catch (Exception $e) {
-                $this->log('error', "Erro ao descriptografar token: " . $e->getMessage());
-            }
-        }
-        
-        $this->log('error', "Token da API não encontrado nas configurações");
-        return null;
-    }
-    
+
     /**
      * Formata as informações do pagador para incluir na nota
      * 
@@ -1036,65 +556,6 @@ private function updateTransaction($transaction, $new_status, $paid_at = null, $
     }
     
     /**
-     * Processa um pagamento diretamente a partir do ID da fatura
-     * 
-     * @param int $invoice_id ID da fatura
-     * @param string $transaction_id ID da transação
-     * @param string $status Status da transação
-     * @param string $paid_at Data do pagamento
-     * @param float $amount Valor do pagamento
-     * @param array|object $payer_info Informações do pagador
-     * @param string $payment_type Tipo de pagamento ('pix' ou 'boleto')
-     * @return bool True se processado com sucesso, false caso contrário
-     */
-    private function processDirectPayment($invoice_id, $transaction_id, $status, $paid_at = null, $amount = null, $payer_info = null, $payment_type = 'pix') {
-        try {
-            $this->log('info', "=== PROCESSAMENTO DIRETO DE PAGAMENTO ===", [
-                'invoice_id' => $invoice_id,
-                'transaction_id' => $transaction_id,
-                'status' => $status,
-                'payment_type' => $payment_type
-            ]);
-            
-            // Verifica se a fatura existe
-            $invoice = $this->invoices_model->get($invoice_id);
-            if (!$invoice) {
-                $this->log('error', "Fatura ID {$invoice_id} não encontrada");
-                return false;
-            }
-            
-            // Verifica se o pagamento já foi processado
-            $already_exists = $this->checkPaymentExists($invoice_id, $transaction_id);
-            if ($already_exists) {
-                $this->log('info', "Pagamento já registrado anteriormente");
-                $this->safeUpdateInvoiceStatus($invoice_id);
-                return true;
-            }
-            
-            // Se não temos o valor, usamos o total da fatura
-            if ($amount === null || $amount <= 0) {
-                $amount = $invoice->total;
-                $this->log('debug', "Valor não fornecido ou inválido, usando total da fatura: {$amount}");
-            }
-            
-            // Registra o pagamento no Perfex
-            $payment_registered = $this->registerPayment($invoice_id, $transaction_id, $status, $paid_at, $amount, $payer_info, $payment_type);
-            
-            if ($payment_registered) {
-                $this->log('info', "Pagamento registrado com sucesso");
-                return true;
-            } else {
-                $this->log('error', "Falha ao registrar pagamento");
-                return false;
-            }
-            
-        } catch (Exception $e) {
-            $this->log('error', "Erro no processamento direto: " . $e->getMessage());
-            return false;
-        }
-    }
-    
-    /**
      * Processa o pagamento no Perfex CRM
      * 
      * @param object $transaction Dados da transação
@@ -1138,7 +599,7 @@ private function updateTransaction($transaction, $new_status, $paid_at = null, $
             // Registra o pagamento
             return $this->registerPayment($transaction->invoice_id, $pagou_transaction_id, $new_status, $paid_at, $amount_final, $payer_info, $payment_type);
             
-        } catch (Exception $e) {
+        } catch (\Throwable $e) {
             $this->log('error', "Erro no processamento: " . $e->getMessage());
             return false;
         }
@@ -1219,7 +680,7 @@ private function updateTransaction($transaction, $new_status, $paid_at = null, $
             
             return true;
             
-        } catch (Exception $e) {
+        } catch (\Throwable $e) {
             $this->log('error', "Erro ao registrar pagamento: " . $e->getMessage());
             return false;
         }
@@ -1273,7 +734,7 @@ private function updateTransaction($transaction, $new_status, $paid_at = null, $
                 $this->log('warning', 'Tabela invoiceactivity não existe, atividade de atualização de status não registrada');
             }
             
-        } catch (Exception $e) {
+        } catch (\Throwable $e) {
             $this->log('error', "Erro ao atualizar status da fatura: " . $e->getMessage());
         }
     }
@@ -1322,7 +783,7 @@ private function updateTransaction($transaction, $new_status, $paid_at = null, $
             ]);
             
             $this->log('debug', "Atividade registrada para fatura ID: {$invoice_id}");
-        } catch (Exception $e) {
+        } catch (\Throwable $e) {
             $this->log('error', "Erro ao registrar atividade: " . $e->getMessage());
         }
     }
@@ -1368,7 +829,7 @@ private function updateTransaction($transaction, $new_status, $paid_at = null, $
                 // Envia comando para atualizar a página
                 $this->sendRefreshCommand($invoice_id);
             }
-        } catch (Exception $e) {
+        } catch (\Throwable $e) {
             $this->log('error', "Erro ao atualizar status: " . $e->getMessage());
         }
     }

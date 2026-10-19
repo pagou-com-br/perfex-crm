@@ -87,7 +87,7 @@ class Pagou_boleto_gateway extends App_gateway
             ],
             [
                 'name'          => 'discount_value',
-                'label'         => '     ⤷ Valor: se fixed=centavos (500=R$5,00), se percentage=% (10=10%)',
+                'label'         => '     ⤷ Valor: se fixed=reais (5.00=R$5,00), se percentage=% (10=10%)',
                 'type'          => 'input',
                 'default_value' => '0'
             ],
@@ -121,7 +121,7 @@ class Pagou_boleto_gateway extends App_gateway
             ],
             [
                 'name'          => 'interest_value',
-                'label'         => '     ⤷ Valor percentual de juros ao dia (0.1 até 1%, padrão: 0.33%)',
+                'label'         => '     ⤷ Juros: percentual MENSAL, cobrado por dia de atraso (ex.: 1 = 1% ao mês)',
                 'type'          => 'input',
                 'default_value' => '0.33'
             ],
@@ -323,7 +323,7 @@ class Pagou_boleto_gateway extends App_gateway
         $payment_data = [
             'amount'           => $amount_formatted,
             'description'      => mb_substr($description, 0, 140), // API Pagou: max 140 caracteres
-            'due_date'         => date('Y-m-d', strtotime($invoice->duedate)),
+            'due_date'         => (!empty($invoice->duedate) && $invoice->duedate > date('Y-m-d')) ? date('Y-m-d', strtotime($invoice->duedate)) : date('Y-m-d'),
             'notification_url' => $notification_url,
             'external_id'      => $external_id,
             'payer'            => [
@@ -384,7 +384,7 @@ class Pagou_boleto_gateway extends App_gateway
                 $discount_days_before = (int) $this->getSetting('discount_limit_date');
                 $discount_limit_date = date('Y-m-d', strtotime($invoice->duedate . ' -' . $discount_days_before . ' days'));
                 
-                $api_discount_value = ($discount_type === 'fixed') ? (int) $discount_value_input : floatval(str_replace(',', '.', $discount_value_input));
+                $api_discount_value = round(floatval(str_replace(',', '.', $discount_value_input)), 2);
                 $payment_data['discount'] = [
                     'type'       => $discount_type,
                     'amount'     => $api_discount_value,
@@ -409,23 +409,23 @@ class Pagou_boleto_gateway extends App_gateway
         if ($this->getSetting('enable_interest') === '1') {
             $interest_value_input = $this->getSetting('interest_value');
             if (is_numeric($interest_value_input) && $interest_value_input > 0) {
-                // Garantir que o valor esteja dentro dos limites (0.1 a 1%)
-                $interest_value = min(max(floatval(str_replace(',', '.', $interest_value_input)), 0.1), 1);
+                // Percentual mensal; a API aceita de 0.1 a 100
+                $interest_value = min(max(floatval(str_replace(',', '.', $interest_value_input)), 0.1), 100);
                 $payment_data['interest'] = $interest_value;
-                $this->log('debug', 'Juros configurados para API: ' . $interest_value . '% ao dia');
+                $this->log('debug', 'Juros configurados para API: ' . $interest_value . '% ao mês');
             }
         }
         
-        // Adiciona Período de Carência se habilitado
+        // grace_period é obrigatório na API (1 a 30 dias); padrão 1 quando a carência está desligada
+        $grace_period = 1;
         if ($this->getSetting('enable_grace_period') === '1') {
             $grace_period_input = $this->getSetting('grace_period_days');
             if (is_numeric($grace_period_input) && $grace_period_input > 0) {
-                // Garantir que o valor esteja dentro dos limites (1 a 30 dias)
                 $grace_period = min(max((int) $grace_period_input, 1), 30);
-                $payment_data['grace_period'] = $grace_period;
-                $this->log('debug', 'Período de carência configurado para API: ' . $grace_period . ' dias');
             }
         }
+        $payment_data['grace_period'] = $grace_period;
+        $this->log('debug', 'Período de carência configurado para API: ' . $grace_period . ' dias');
 
         $this->log('debug', 'Payload final para API Pagou:', $payment_data);
 
@@ -434,7 +434,7 @@ class Pagou_boleto_gateway extends App_gateway
         $environment = $is_production ? 'production' : 'sandbox';
         
         // Configurando corretamente o endpoint de acordo com o ambiente
-        $api_endpoint = $is_production ? 'https://api.pagou.com.br/v1/charges' : 'https://sandbox-api.pagou.com.br/v1/charges';
+        $api_endpoint = pagou_api_base_url($is_production) . '/v1/charges';
         
         $this->log('debug', 'API endpoint selecionado: ' . $api_endpoint . ' (Ambiente: ' . $environment . ')');
 
@@ -463,18 +463,15 @@ class Pagou_boleto_gateway extends App_gateway
         curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
         
         // Adiciona captura de informações de requisição
-        curl_setopt($ch, CURLINFO_HEADER_OUT, true);
 
         $response_body = curl_exec($ch);
         $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $request_headers = curl_getinfo($ch, CURLINFO_HEADER_OUT);
         $content_type = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
         $total_time = curl_getinfo($ch, CURLINFO_TOTAL_TIME);
         $curl_error = curl_error($ch);
         curl_close($ch);
 
         // Logs detalhados após a requisição
-        $this->log('debug', 'Cabeçalhos reais enviados', $request_headers);
         $this->log('debug', 'Tempo total da requisição', $total_time . ' segundos');
         $this->log('debug', 'Código HTTP recebido', $http_code);
         $this->log('debug', 'Tipo de conteúdo recebido', $content_type);
@@ -613,7 +610,7 @@ class Pagou_boleto_gateway extends App_gateway
         
         // Determina o ambiente
         $is_production = $this->getSetting('is_production') === '1';
-        $api_base = $is_production ? 'https://api.pagou.com.br' : 'https://sandbox-api.pagou.com.br';
+        $api_base = pagou_api_base_url($is_production);
         $api_endpoint = $api_base . '/v1/charges/' . $transaction_id;
         
         $this->log('debug', 'URL da API para consulta: ' . $api_endpoint);
@@ -1052,7 +1049,7 @@ class Pagou_boleto_gateway extends App_gateway
         
         // Determinando o ambiente (produção ou sandbox)
         $is_production = $this->getSetting('is_production') === '1';
-        $api_base = $is_production ? 'https://api.pagou.com.br' : 'https://sandbox-api.pagou.com.br';
+        $api_base = pagou_api_base_url($is_production);
         $api_endpoint = $api_base . '/v1/charges/' . $transaction_id;
         
         $this->log('debug', 'API endpoint de consulta', $api_endpoint);
@@ -1068,17 +1065,14 @@ class Pagou_boleto_gateway extends App_gateway
         curl_setopt($ch, CURLOPT_TIMEOUT, 40);
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
         curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
-        curl_setopt($ch, CURLINFO_HEADER_OUT, true);
         
         $response_body = curl_exec($ch);
         $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $request_headers = curl_getinfo($ch, CURLINFO_HEADER_OUT);
         $content_type = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
         $total_time = curl_getinfo($ch, CURLINFO_TOTAL_TIME);
         $curl_error = curl_error($ch);
         curl_close($ch);
         
-        $this->log('debug', 'Cabeçalhos enviados na consulta', $request_headers);
         $this->log('debug', 'Tempo total da consulta', $total_time . ' segundos');
         $this->log('debug', 'Código HTTP recebido', $http_code);
         $this->log('debug', 'Resposta da consulta', $response_body);
@@ -1226,7 +1220,7 @@ class Pagou_boleto_gateway extends App_gateway
                     try {
                         $this->ci->db->query("ALTER TABLE `{$table_name}` ADD COLUMN `{$column}` {$definition}");
                         $this->log('info', "Coluna {$column} adicionada com sucesso.");
-                    } catch (Exception $e) {
+                    } catch (\Throwable $e) {
                         $this->log('error', "Erro ao adicionar coluna {$column}: " . $e->getMessage());
                         // Continue para tentar adicionar outras colunas
                     }
@@ -1239,7 +1233,7 @@ class Pagou_boleto_gateway extends App_gateway
                 try {
                     $this->ci->db->query("ALTER TABLE `{$table_name}` ADD INDEX `invoice_id` (`invoice_id`)");
                     $this->log('info', "Índice para invoice_id adicionado com sucesso.");
-                } catch (Exception $e) {
+                } catch (\Throwable $e) {
                     $this->log('error', "Erro ao adicionar índice para invoice_id: " . $e->getMessage());
                 }
             }
@@ -1249,7 +1243,7 @@ class Pagou_boleto_gateway extends App_gateway
                 try {
                     $this->ci->db->query("ALTER TABLE `{$table_name}` ADD INDEX `transaction_id` (`transaction_id`(191))");
                     $this->log('info', "Índice para transaction_id adicionado com sucesso.");
-                } catch (Exception $e) {
+                } catch (\Throwable $e) {
                     $this->log('error', "Erro ao adicionar índice para transaction_id: " . $e->getMessage());
                 }
             }
@@ -1259,7 +1253,7 @@ class Pagou_boleto_gateway extends App_gateway
                 try {
                     $this->ci->db->query("ALTER TABLE `{$table_name}` ADD INDEX `external_id` (`external_id`(191))");
                     $this->log('info', "Índice para external_id adicionado com sucesso.");
-                } catch (Exception $e) {
+                } catch (\Throwable $e) {
                     $this->log('error', "Erro ao adicionar índice para external_id: " . $e->getMessage());
                 }
             }

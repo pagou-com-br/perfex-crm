@@ -1,12 +1,14 @@
 <?php
 defined('BASEPATH') or exit('No direct script access allowed');
 
+/**
+ * Webhook das cobranças PIX Avulso (notification_url = pagou/notification).
+ * Cobranças avulsas não têm fatura: o evento só atualiza o status da cobrança.
+ */
 class Notification extends App_Controller
 {
     /**
-     * Propriedade para controlar o estado dos logs.
-     * Se a opção "pagou_logs_api" na tabela tbloptions (db_prefix().'options')
-     * tiver o valor "1", os logs serão ativados; caso contrário, serão desativados.
+     * Logs ativados pela opção "pagou_logs_api".
      *
      * @var bool
      */
@@ -17,157 +19,140 @@ class Notification extends App_Controller
         parent::__construct();
         $this->load->database();
 
-        // Consulta a configuração na tabela de opções (tbloptions)
-        $log_option = $this->db->get_where(db_prefix().'options', ['name' => 'pagou_logs_api'])->row();
-        if ($log_option && $log_option->value === '1') {
-            $this->enable_logs = true;
-        } else {
-            $this->enable_logs = false;
-        }
-
-        $this->logDebug('Construtor da classe Notification chamado. Logs ' . ($this->enable_logs ? 'ativados' : 'desativados') . '.');
+        $this->enable_logs = (get_option('pagou_logs_api') === '1');
     }
 
     /**
-     * Método auxiliar para registrar logs quando habilitados.
+     * Registra logs quando habilitados. Nunca registra o corpo do webhook.
      *
-     * @param string $message Mensagem a ser registrada no log.
+     * @param string $message
      * @return void
      */
     private function logDebug($message)
     {
         if ($this->enable_logs) {
-            log_message('debug', $message);
+            log_message('debug', '[Pagou Notification] ' . $message);
         }
     }
 
     /**
-     * Método principal para processar a notificação de pagamento via PIX.
+     * Processa o webhook de pagamento das cobranças PIX Avulso.
      *
      * @return void
      */
     public function index()
     {
-        $this->logDebug('Método index iniciado.');
-
-        // Lê o payload (JSON) recebido
+        // Corpo bruto: a assinatura é calculada sobre os bytes exatos recebidos
         $raw_input = file_get_contents('php://input');
-        $this->logDebug('Payload recebido: ' . $raw_input);
+
+        if (!pagou_authenticate_webhook_request($raw_input)) {
+            $this->logDebug('Webhook rejeitado: X-Pagou-Signature ausente ou inválida.');
+            $this->respond(401, 'Assinatura inválida.');
+            return;
+        }
 
         $data = json_decode($raw_input, true);
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            $this->logDebug('Erro ao decodificar JSON: ' . json_last_error_msg());
-        } else {
-            $this->logDebug('JSON decodificado com sucesso.');
-        }
+        $event_name = $data['name'] ?? null;
+        $pagou_id = $data['data']['id'] ?? null;
 
-        // Valida o payload
-        if (!isset($data['data']['id']) || empty($data['data']['id'])) {
-            http_response_code(400);
-            $this->logDebug('Resposta 400: Payload inválido.');
-            echo "<html><body><h1>Invalid payload</h1></body></html>";
+        if (!is_string($pagou_id) || $pagou_id === '') {
+            $this->respond(400, 'Payload inválido.');
             return;
         }
 
-        // Extrai dados do payload
-        $transactionId = $data['data']['id'];
-        $payerData     = isset($data['data']['payer']['bank']) ? $data['data']['payer']['bank'] : [];
-        $payerName     = isset($payerData['name']) ? $payerData['name'] : 'Desconhecido';
-        $payerDocument = isset($payerData['document']) ? $payerData['document'] : 'Desconhecido';
-
-        $this->logDebug('Transaction ID capturado: ' . $transactionId);
-        $this->logDebug("Dados do pagador: Nome: {$payerName}, Documento: {$payerDocument}");
-
-        // Busca a transação no banco
-        $this->db->where('transaction_id', $transactionId);
-        $transaction = $this->db->get(db_prefix() . 'pagou_transactions_pix')->row();
-
-        if (!$transaction) {
-            http_response_code(400);
-            $this->logDebug('Transação não encontrada: ' . $transactionId);
-            echo "<html><body><h1>Transaction not found</h1></body></html>";
+        if ($event_name !== 'qrcode.completed') {
+            $this->logDebug("Evento ignorado: {$event_name}");
+            $this->respond(200, 'Evento ignorado.');
             return;
-        } else {
-            $this->logDebug('Transação encontrada: ' . print_r($transaction, true));
         }
 
-        // Atualiza a tabela pagou_transactions_pix
-        $update_data = [
-            'status'         => 'paid',
-            'data_pagamento' => date('Y-m-d H:i:s')
-        ];
-        $this->db->where('transaction_id', $transactionId);
-        $this->db->update(db_prefix() . 'pagou_transactions_pix', $update_data);
+        $table = db_prefix() . 'pix_avulso';
+        $charge = $this->db->where('qr_code', $pagou_id)->get($table)->row();
 
-        if ($this->db->affected_rows() > 0) {
-            $this->logDebug('Tabela pagou_transactions_pix atualizada com status "paid".');
-        } else {
-            $this->logDebug('Nenhuma linha atualizada em pagou_transactions_pix para transaction_id: ' . $transactionId);
+        if (!$charge) {
+            $this->logDebug("Cobrança {$pagou_id} não pertence a este Perfex. Evento ignorado.");
+            $this->respond(200, 'Cobrança desconhecida. Evento ignorado.');
+            return;
         }
 
-        // Atualiza o status da fatura na tabela tblinvoices
-        $invoiceId = $transaction->invoice_id;
-        $this->db->where('id', $invoiceId);
-        $this->db->update(db_prefix() . 'invoices', ['status' => 2]);
-        if ($this->db->affected_rows() > 0) {
-            $this->logDebug("Fatura ID {$invoiceId} atualizada para status '2' (Pago).");
-        } else {
-            $this->logDebug("Nenhuma atualização realizada na fatura ID {$invoiceId}.");
+        if ($charge->status === 'pago') {
+            $this->respond(200, 'Cobrança já paga.');
+            return;
         }
 
-        // Registra o pagamento na tblinvoicepaymentrecords
-        $payment_data = [
-            'invoiceid'     => $invoiceId,
-            'amount'        => $transaction->amount_final,
-            'paymentmode'   => 'pix',
-            'paymentmethod' => null,
-            'date'          => date('Y-m-d'),
-            'daterecorded'  => "Nome: {$payerName}, Documento: {$payerDocument}",
-            'transactionid' => $transactionId,
-            'note'          => "Pagamento via PIX. Pagador: {$payerName}, Documento: {$payerDocument}"
-        ];
-        $this->db->insert(db_prefix() . 'invoicepaymentrecords', $payment_data);
-        if ($this->db->affected_rows() > 0) {
-            $this->logDebug('Registro de pagamento inserido com sucesso na tabela invoicepaymentrecords.');
-        } else {
-            $this->logDebug('Falha ao inserir registro de pagamento na tabela invoicepaymentrecords.');
+        // Confirma o pagamento na API antes de atualizar
+        $api_status = $this->fetchPixStatus($pagou_id);
+        if ($api_status === null) {
+            $this->respond(503, 'Não foi possível confirmar o pagamento na API. Reenvie depois.');
+            return;
         }
 
-        // Registra log de atividade no sistema
-        $activity_message = 'Pagamento via PIX recebido para a fatura #' . format_invoice_number($invoiceId);
-        log_activity($activity_message);
-        $this->logDebug("Atividade registrada: {$activity_message}");
+        if ($api_status !== 4) {
+            $this->logDebug("Cobrança {$pagou_id} não está paga na API. Status: {$api_status}");
+            $this->respond(200, 'Pagamento ainda não confirmado pela API.');
+            return;
+        }
 
-        // Resposta de sucesso em HTML, com script para recarregar a página
-        http_response_code(200);
-        $this->logDebug('Resposta 200 enviada: Webhook processado com sucesso.');
+        $this->db->where('id', $charge->id)->update($table, [
+            'status'           => 'pago',
+            'data_modificacao' => date('Y-m-d H:i:s'),
+        ]);
 
-        echo "<html><body>";
-        echo "<h1>Pagamento processado com sucesso</h1>";
-        echo "<script>window.location.reload();</script>";
-        echo "</body></html>";
+        log_activity('Pagamento PIX Avulso confirmado pela Pagou: ' . $charge->descricao . ' [ID: ' . $charge->id . ']');
+        $this->respond(200, 'Pagamento processado com sucesso.');
     }
 
     /**
-     * Método para ativar os logs manualmente.
+     * Consulta o status numérico de um Pix na API (4 = pago).
      *
-     * @return void
+     * @param string $pagou_id
+     * @return int|null Status ou null em caso de falha
      */
-    public function enableLogs()
+    private function fetchPixStatus($pagou_id)
     {
-        $this->enable_logs = true;
-        $this->logDebug('Logs ativados via método enableLogs().');
+        $api_token = pagou_gateway_api_token('pagou_pix');
+        if (!$api_token) {
+            $this->logDebug('Chave da API do gateway Pix não configurada.');
+            return null;
+        }
+
+        $ch = curl_init(pagou_gateway_api_base_url('pagou_pix') . '/v1/pix/' . rawurlencode($pagou_id));
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER     => [
+                'Accept: application/json',
+                'User-Agent: pagou-perfex/1.2.1',
+                'X-API-KEY: ' . $api_token,
+            ],
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_TIMEOUT        => 20,
+            CURLOPT_FOLLOWLOCATION => false,
+        ]);
+        $response = curl_exec($ch);
+        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($http_code !== 200) {
+            $this->logDebug("Falha ao consultar o Pix {$pagou_id}: HTTP {$http_code}");
+            return null;
+        }
+
+        $result = json_decode($response, true);
+
+        return isset($result['status']) && is_numeric($result['status']) ? (int) $result['status'] : null;
     }
 
     /**
-     * Método para desativar os logs manualmente.
+     * Responde em JSON e encerra.
      *
+     * @param int    $code
+     * @param string $message
      * @return void
      */
-    public function disableLogs()
+    private function respond($code, $message)
     {
-        $this->logDebug('Logs desativados via método disableLogs().');
-        $this->enable_logs = false;
+        http_response_code($code);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['status' => $code, 'message' => $message]);
     }
 }
-?>

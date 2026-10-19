@@ -55,7 +55,8 @@ function cancel_pagou_boleto($invoice_id)
        ============================ */
     // Verificar se existe um boleto para esta fatura
     $transaction = $CI->db->where('invoice_id', $invoice_id)
-                         ->get(db_prefix() . 'pagou_transactions')
+                         ->order_by('id', 'DESC')
+                         ->get(db_prefix() . 'pagou_transactions_boleto')
                          ->row();
 
     if (!$transaction) {
@@ -69,7 +70,7 @@ function cancel_pagou_boleto($invoice_id)
          Verificação do Status do Boleto
        ============================ */
     // Se o boleto já estiver cancelado ou pago, não precisa fazer nada
-    if (in_array($transaction->status, ['cancelled', 'paid'])) {
+    if (in_array(pagou_normalize_status($transaction->status, 'boleto'), ['cancelled', 'paid', 'refunded'], true)) {
         /*
         log_activity('Boleto já está cancelado ou pago para fatura #' . $invoice_id);
         */
@@ -87,7 +88,7 @@ function cancel_pagou_boleto($invoice_id)
          Configuração do Endpoint da API
        ============================ */
     // Configurar endpoint da API
-    $api_endpoint = 'https://api.pagou.com.br/v1/charges/' . $transaction->transaction_id;
+    $api_endpoint = pagou_gateway_api_base_url('pagou_boleto') . '/v1/charges/' . rawurlencode($transaction->transaction_id);
     $api_token = $gateway->decryptSetting('api_token');
 
     try {
@@ -100,8 +101,12 @@ function cancel_pagou_boleto($invoice_id)
         curl_setopt_array($ch, [
             CURLOPT_CUSTOMREQUEST => 'DELETE',
             CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_TIMEOUT => 30,
+            CURLOPT_FOLLOWLOCATION => false,
             CURLOPT_HTTPHEADER => [
-                'Content-Type: application/json',
+                'Accept: application/json',
+                'User-Agent: pagou-perfex/1.2.1',
                 'X-API-KEY: ' . $api_token
             ]
         ]);
@@ -127,10 +132,10 @@ function cancel_pagou_boleto($invoice_id)
                  Atualização da Transação no Banco de Dados
                ============================ */
             // Atualizar o status da transação no banco de dados
-            $CI->db->where('invoice_id', $invoice_id)
-                   ->update(db_prefix() . 'pagou_transactions', [
-                       'status' => 'cancelled',
-                       'date_updated' => date('Y-m-d H:i:s')
+            // 204 indica que o pedido foi aceito; o webhook/consulta confirma o estado final
+            $CI->db->where('id', $transaction->id)
+                   ->update(db_prefix() . 'pagou_transactions_boleto', [
+                       'status' => 'cancelled'
                    ]);
 
             /*
@@ -198,4 +203,185 @@ function get_customer_address_number($client_id)
 
     return $field_value ? $field_value->value : '';
 }
-?>
+
+
+/* ============================
+     Ambiente, credenciais e webhooks
+   ============================ */
+
+/**
+ * URL base da API Pagou para o ambiente informado.
+ * Sandbox: https://api.pagou.cloud · Produção: https://api.pagou.com.br
+ *
+ * @param bool $is_production
+ * @return string
+ */
+function pagou_api_base_url($is_production)
+{
+    return $is_production ? 'https://api.pagou.com.br' : 'https://api.pagou.cloud';
+}
+
+/**
+ * Indica se o gateway (pagou_pix, pagou_boleto) está configurado para produção.
+ *
+ * @param string $gateway_id
+ * @return bool
+ */
+function pagou_gateway_is_production($gateway_id)
+{
+    return get_option('paymentmethod_' . $gateway_id . '_is_production') === '1';
+}
+
+/**
+ * URL base da API para o ambiente configurado no gateway.
+ *
+ * @param string $gateway_id
+ * @return string
+ */
+function pagou_gateway_api_base_url($gateway_id)
+{
+    return pagou_api_base_url(pagou_gateway_is_production($gateway_id));
+}
+
+/**
+ * Chave de API descriptografada do gateway, ou null se não configurada.
+ *
+ * @param string $gateway_id
+ * @return string|null
+ */
+function pagou_gateway_api_token($gateway_id)
+{
+    $CI = &get_instance();
+    $value = get_option('paymentmethod_' . $gateway_id . '_api_token');
+    if (empty($value)) {
+        return null;
+    }
+    $CI->load->library('encryption');
+    $token = $CI->encryption->decrypt($value);
+
+    return $token ? trim($token) : null;
+}
+
+/**
+ * Chaves de API configuradas nos gateways da Pagou, sem repetição.
+ * Usadas para autenticar webhooks, que são assinados com a chave da cobrança.
+ *
+ * @return string[]
+ */
+function pagou_configured_api_tokens()
+{
+    $tokens = [];
+    foreach (['pagou_pix', 'pagou_boleto'] as $gateway_id) {
+        $token = pagou_gateway_api_token($gateway_id);
+        if ($token) {
+            $tokens[] = $token;
+        }
+    }
+
+    return array_values(array_unique($tokens));
+}
+
+/**
+ * Valida a assinatura HMAC-SHA256 de um webhook da Pagou.
+ * A mensagem assinada é o timestamp concatenado ao corpo bruto, sem separador.
+ *
+ * @param string      $raw_body  Corpo bruto da requisição
+ * @param string|null $timestamp Cabeçalho X-Pagou-Timestamp (segundos Unix)
+ * @param string|null $signature Cabeçalho X-Pagou-Signature (64 caracteres hex)
+ * @param string[]    $api_keys  Chaves candidatas
+ * @param int         $tolerance Diferença máxima, em segundos, entre o timestamp e o relógio local
+ * @return bool
+ */
+function pagou_verify_webhook_signature($raw_body, $timestamp, $signature, array $api_keys, $tolerance = 300)
+{
+    $timestamp = trim((string) $timestamp);
+    $signature = strtolower(trim((string) $signature));
+
+    if ($timestamp === '' || strlen($timestamp) > 16 || !ctype_digit($timestamp)) {
+        return false;
+    }
+    if (abs(time() - (int) $timestamp) > $tolerance) {
+        return false;
+    }
+    if (!preg_match('/^[0-9a-f]{64}$/', $signature)) {
+        return false;
+    }
+
+    foreach ($api_keys as $key) {
+        if ($key !== '' && hash_equals(hash_hmac('sha256', $timestamp . $raw_body, $key), $signature)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Autentica o webhook da requisição atual com as chaves configuradas.
+ *
+ * @param string $raw_body Corpo bruto da requisição
+ * @return bool
+ */
+function pagou_authenticate_webhook_request($raw_body)
+{
+    $timestamp = $_SERVER['HTTP_X_PAGOU_TIMESTAMP'] ?? null;
+    $signature = $_SERVER['HTTP_X_PAGOU_SIGNATURE'] ?? null;
+
+    return pagou_verify_webhook_signature($raw_body, $timestamp, $signature, pagou_configured_api_tokens());
+}
+
+/**
+ * Valor pago informado por um evento de webhook.
+ * Em charge.paid, amount é um objeto {paid, original}; nos eventos de Pix, um número em reais.
+ *
+ * @param array $event_data Conteúdo de data do webhook
+ * @return float|null
+ */
+function pagou_event_amount(array $event_data)
+{
+    $amount = $event_data['amount'] ?? null;
+    if (is_array($amount)) {
+        $amount = $amount['paid'] ?? null;
+    }
+
+    return is_numeric($amount) ? (float) $amount : null;
+}
+
+/**
+ * Converte o estado da API para o vocabulário local das tabelas de transação.
+ * Pix: 1 pendente, 2 ativo, 3 cancelado, 4 pago, 5 estornado, 6 removido.
+ * Boleto: 1 pendente, 2 ativo, 3 cancelado, 4/8/9 pago, 5 estornado, 6 rejeitado, 7 outro.
+ *
+ * @param mixed  $status       Estado numérico da API ou rótulo local
+ * @param string $payment_type 'pix' ou 'boleto'
+ * @return string
+ */
+function pagou_normalize_status($status, $payment_type = 'pix')
+{
+    if (is_numeric($status)) {
+        $map = [
+            1 => 'pending',
+            2 => 'active',
+            3 => 'cancelled',
+            4 => 'paid',
+            5 => 'refunded',
+            6 => ($payment_type === 'pix') ? 'removed' : 'rejected',
+            7 => 'other',
+            8 => 'paid',
+            9 => 'paid',
+        ];
+
+        return $map[(int) $status] ?? 'unknown';
+    }
+
+    $status = strtolower(trim((string) $status));
+    $aliases = [
+        'confirmed' => 'paid',
+        'refund'    => 'refunded',
+        'estornado' => 'refunded',
+        'estorno'   => 'refunded',
+        'canceled'  => 'cancelled',
+    ];
+
+    return $aliases[$status] ?? $status;
+}

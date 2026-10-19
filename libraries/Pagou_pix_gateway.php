@@ -359,7 +359,7 @@ class Pagou_pix_gateway extends App_gateway
                         'value' => $api_fine_value,
                     ];
                     $this->log('debug', 'Multa configurada para API:', $payment_data['fine']);
-                } catch (Exception $e) {
+                } catch (\Throwable $e) {
                     $this->log('error', 'Erro ao calcular data da multa: ' . $e->getMessage());
                 }
             }
@@ -388,7 +388,7 @@ class Pagou_pix_gateway extends App_gateway
                         'value' => $api_interest_value,
                     ];
                     $this->log('debug', 'Juros configurados para API:', $payment_data['interest']);
-                } catch (Exception $e) {
+                } catch (\Throwable $e) {
                     $this->log('error', 'Erro ao calcular data dos juros: ' . $e->getMessage());
                 }
             }
@@ -399,7 +399,7 @@ class Pagou_pix_gateway extends App_gateway
         $is_production = $this->getSetting('is_production') === '1';
         $environment = $is_production ? 'production' : 'sandbox';
         
-        $api_endpoint = $is_production ? 'https://api.pagou.com.br/v1/pix' : 'https://sandbox-api.pagou.com.br/v1/pix';
+        $api_endpoint = pagou_api_base_url($is_production) . '/v1/pix';
         
         $this->log('debug', 'API endpoint selecionado: ' . $api_endpoint . ' (Ambiente: ' . $environment . ')');
 
@@ -426,17 +426,14 @@ class Pagou_pix_gateway extends App_gateway
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
         curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
         
-        curl_setopt($ch, CURLINFO_HEADER_OUT, true);
 
         $response_body = curl_exec($ch);
         $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $request_headers = curl_getinfo($ch, CURLINFO_HEADER_OUT);
         $content_type = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
         $total_time = curl_getinfo($ch, CURLINFO_TOTAL_TIME);
         $curl_error = curl_error($ch);
         curl_close($ch);
 
-        $this->log('debug', 'Cabeçalhos reais enviados', $request_headers);
         $this->log('debug', 'Tempo total da requisição', $total_time . ' segundos');
         $this->log('debug', 'Código HTTP recebido', $http_code);
         $this->log('debug', 'Tipo de conteúdo recebido', $content_type);
@@ -622,7 +619,7 @@ class Pagou_pix_gateway extends App_gateway
         $this->log('info', "=== VERIFICANDO STATUS DA TRANSAÇÃO ===", $transaction_id);
         
         $is_production = $this->getSetting('is_production') === '1';
-        $api_base = $is_production ? 'https://api.pagou.com.br' : 'https://sandbox-api.pagou.com.br';
+        $api_base = pagou_api_base_url($is_production);
         $api_endpoint = $api_base . '/v1/pix/' . $transaction_id;
         
         $this->log('debug', 'API endpoint de consulta', $api_endpoint);
@@ -638,17 +635,14 @@ class Pagou_pix_gateway extends App_gateway
         curl_setopt($ch, CURLOPT_TIMEOUT, 40);
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
         curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
-        curl_setopt($ch, CURLINFO_HEADER_OUT, true);
         
         $response_body = curl_exec($ch);
         $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $request_headers = curl_getinfo($ch, CURLINFO_HEADER_OUT);
         $content_type = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
         $total_time = curl_getinfo($ch, CURLINFO_TOTAL_TIME);
         $curl_error = curl_error($ch);
         curl_close($ch);
         
-        $this->log('debug', 'Cabeçalhos enviados na consulta', $request_headers);
         $this->log('debug', 'Tempo total da consulta', $total_time . ' segundos');
         $this->log('debug', 'Código HTTP recebido', $http_code);
         $this->log('debug', 'Resposta da consulta', $response_body);
@@ -775,7 +769,7 @@ class Pagou_pix_gateway extends App_gateway
                     try {
                         $this->ci->db->query("ALTER TABLE `{$table_name}` ADD COLUMN `{$column}` {$definition}");
                         $this->log('info', "Coluna {$column} adicionada com sucesso.");
-                    } catch (Exception $e) {
+                    } catch (\Throwable $e) {
                         $this->log('error', "Erro ao adicionar coluna {$column}: " . $e->getMessage());
                     }
                 }
@@ -786,7 +780,7 @@ class Pagou_pix_gateway extends App_gateway
                 try {
                     $this->ci->db->query("ALTER TABLE `{$table_name}` ADD INDEX `invoice_id` (`invoice_id`)");
                     $this->log('info', "Índice para invoice_id adicionado com sucesso.");
-                } catch (Exception $e) {
+                } catch (\Throwable $e) {
                     $this->log('error', "Erro ao adicionar índice para invoice_id: " . $e->getMessage());
                 }
             }
@@ -796,7 +790,7 @@ class Pagou_pix_gateway extends App_gateway
                 try {
                     $this->ci->db->query("ALTER TABLE `{$table_name}` ADD INDEX `transaction_id` (`transaction_id`)");
                     $this->log('info', "Índice para transaction_id adicionado com sucesso.");
-                } catch (Exception $e) {
+                } catch (\Throwable $e) {
                     $this->log('error', "Erro ao adicionar índice para transaction_id: " . $e->getMessage());
                 }
             }
@@ -806,7 +800,7 @@ class Pagou_pix_gateway extends App_gateway
                 try {
                     $this->ci->db->query("ALTER TABLE `{$table_name}` ADD INDEX `external_id` (`external_id`)");
                     $this->log('info', "Índice para external_id adicionado com sucesso.");
-                } catch (Exception $e) {
+                } catch (\Throwable $e) {
                     $this->log('error', "Erro ao adicionar índice para external_id: " . $e->getMessage());
                 }
             }

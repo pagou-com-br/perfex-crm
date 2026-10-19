@@ -224,7 +224,7 @@ hr {
                           ) {
                               // Atualiza no banco
                               $CI->db->where('id', $charge->id);
-                              $CI->db->update('pix_avulso', ['status' => 'cancelado']);
+                              $CI->db->update(db_prefix() . 'pix_avulso', ['status' => 'cancelado']);
 
                               // Atualiza também o objeto em memória, para exibir corretamente
                               $charge->status = 'cancelado';

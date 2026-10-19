@@ -1,9 +1,6 @@
 <?php
 defined('BASEPATH') or exit('No direct script access allowed');
 
-// Define webhook route - single route definition
-$route['pagou/webhook'] = 'pagou/webhook';
-log_message('debug', 'Rota para webhook carregada corretamente.');
 $route['pagou/notification'] = 'notification/index';
 
 // Payment check route

@@ -136,7 +136,7 @@ class Pagou extends AdminController
             // Gera e exibe o código de barras como imagem
             $this->writeLog('debug', "Gerando código de barras para o dado: {$data}");
             echo $renderer->render($barcode, 400, 100); // Ajuste os tamanhos conforme necessário
-        } catch (Exception $e) {
+        } catch (\Throwable $e) {
             // Trata erros
             $this->writeLog('error', 'Erro ao gerar código de barras: ' . $e->getMessage());
             http_response_code(500);
@@ -159,6 +159,10 @@ class Pagou extends AdminController
      */
     public function cobrancas_emitidas()
     {
+        if (!staff_can('access_reembolso', 'pagou_module')) {
+            access_denied('Reembolso de Pagamentos');
+        }
+
         $this->writeLog('info', 'Exibindo a página de Cobranças Emitidas.');
         $data['title'] = 'Cobranças Emitidas Invoice x Pagou';
 
@@ -186,6 +190,12 @@ class Pagou extends AdminController
      */
     public function reembolso_ajax()
     {
+        if (!staff_can('access_reembolso', 'pagou_module')) {
+            header('Content-Type: application/json');
+            echo json_encode(['status' => 'error', 'message' => 'Sem permissão para esta ação.']);
+            return;
+        }
+
         // Início do processamento de reembolso
         $this->writeLog('info', 'Iniciando método reembolso_ajax.');
 
@@ -241,39 +251,57 @@ class Pagou extends AdminController
 
         // Determina o identificador do QR Code / transaction_id
         $transaction_id_to_use = $transaction->transaction_id;
-        $this->writeLog('debug', "ID da transação utilizado: {$transaction_id_to_use}");
 
-        // URL da API Pagou para reembolso PIX
-        $api_url = "https://api.pagou.com.br/v1/pix/{$transaction_id_to_use}/refund";
-        $this->writeLog('debug', "URL da API para reembolso PIX: {$api_url}");
+        if ($transaction->status === 'refund_requested') {
+            echo json_encode(['status' => 'error', 'message' => 'Já existe uma solicitação de estorno para esta cobrança. Aguarde a confirmação da Pagou.']);
+            return;
+        }
 
-        // Prepara o payload para requisição DELETE
-        $payload_refund = [
-            'amount'      => $refund_amount,
-            'description' => $description,
-            'reason'      => $reason
-        ];
-        $this->writeLog('debug', "Payload para reembolso PIX preparado: " . json_encode($payload_refund));
+        // Valida o valor no servidor: positivo, até 2 casas e sem superar o valor pago
+        $refund_amount = round($refund_amount, 2);
+        $paid_amount = (float) $transaction->amount_final;
+        if ($refund_amount <= 0 || ($paid_amount > 0 && $refund_amount > $paid_amount)) {
+            echo json_encode(['status' => 'error', 'message' => 'Valor de estorno inválido.']);
+            return;
+        }
+        if (!in_array($reason, [1, 2, 3, 4], true)) {
+            $reason = 3; // Devolução solicitada pelo cliente final
+        }
+        if (trim((string) $description) === '') {
+            $description = 'Devolução solicitada pelo cliente';
+        }
 
-        // Carrega a API key do gateway (criptografada)
-        $encryptedKey = get_option('paymentmethod_pagou_pix_api_token');
-
-        // Descriptografa a API key
-        $this->load->library('encryption');
-        if (!$encryptedKey) {
-            $this->writeLog('error', 'API key Pagou PIX não encontrada nas configurações.');
+        $apiToken = pagou_gateway_api_token('pagou_pix');
+        if (!$apiToken) {
+            $this->writeLog('error', 'API key Pagou PIX não configurada.');
             echo json_encode(['status' => 'error', 'message' => 'Configuração de API key PIX ausente.']);
             return;
         }
-        $apiToken = $this->encryption->decrypt($encryptedKey);
-        if (!$apiToken) {
-            $this->writeLog('error', 'Falha ao descriptografar a API key Pagou PIX.');
-            echo json_encode(['status' => 'error', 'message' => 'API key PIX inválida ou não configurada.']);
+        $api_base = pagou_gateway_api_base_url('pagou_pix');
+        $resource_url = $api_base . '/v1/pix/' . rawurlencode($transaction_id_to_use);
+
+        // Confere na API: só cobrança paga (status 4) e sem solicitação de estorno registrada
+        $current = $this->pagouRequest('GET', $resource_url, $apiToken);
+        if ($current['http_code'] !== 200 || !is_array($current['body'])) {
+            echo json_encode(['status' => 'error', 'message' => 'Não foi possível consultar a cobrança na Pagou. Tente novamente em instantes.']);
             return;
         }
-        $this->writeLog('debug', "API Token PIX descriptografado: " . substr($apiToken, 0, 4) . '...');
+        if ((int) ($current['body']['status'] ?? 0) !== 4) {
+            echo json_encode(['status' => 'error', 'message' => 'A cobrança não está paga na Pagou e não pode ser estornada.']);
+            return;
+        }
+        if (!empty($current['body']['refund'])) {
+            $this->pagou_model->update_transaction_pix_status($transaction_id_to_use, 'refund_requested', []);
+            echo json_encode(['status' => 'error', 'message' => 'Já existe uma solicitação de estorno registrada na Pagou para esta cobrança.']);
+            return;
+        }
 
-        // Registra a solicitação de reembolso no log da transação
+        $payload_refund = [
+            'amount'      => $refund_amount,
+            'reason'      => $reason,
+            'description' => mb_substr($description, 0, 255),
+        ];
+
         $this->pagou_model->add_refund_log($transaction_id_to_use, [
             'action' => 'refund_requested',
             'amount' => $refund_amount,
@@ -283,210 +311,97 @@ class Pagou extends AdminController
             'staff_name' => get_staff_full_name(get_staff_user_id())
         ]);
 
-        // Faz requisição DELETE para reembolso
-        $this->writeLog('info', 'Iniciando requisição DELETE para reembolso na API Pagou PIX.');
-        $ch = curl_init($api_url);
-        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "DELETE");
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload_refund));
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'Content-Type: application/json',
-            "X-API-KEY: {$apiToken}"
-        ]);
+        $result = $this->pagouRequest('DELETE', $resource_url . '/refund', $apiToken, $payload_refund);
+        $http_code = $result['http_code'];
 
-        $response_raw = curl_exec($ch);
-        $http_code    = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $error_msg    = curl_error($ch);
-        curl_close($ch);
-
-        $this->writeLog('debug', "Resposta bruta da API PIX: {$response_raw}");
-        $this->writeLog('debug', "HTTP Code: {$http_code} - cURL Error: {$error_msg}");
-
-        // Analisa a resposta
-        if ($http_code === 200 || $http_code === 201 || $http_code === 204) {
-            $this->writeLog('info', "Reembolso PIX aprovado pela API para transaction_id: {$transaction_id}. Atualizando status localmente.");
-
-            // Define dados adicionais para atualização
-            $additional_data = [
-                'data_estorno' => date('Y-m-d H:i:s'),
-                'webhook_log' => json_encode([
-                    'refund_amount' => $refund_amount,
-                    'refund_description' => $description,
-                    'refund_reason' => $reason,
-                    'refund_date' => date('Y-m-d H:i:s'),
-                    'http_code' => $http_code,
-                    'response' => $response_raw
-                ])
-            ];
-
-            // Atualiza status da transação para 'refunded'
-            $update_result = $this->pagou_model->update_transaction_pix_status(
-                $transaction_id_to_use, 
-                'refunded',
-                $additional_data
-            );
-            
-            // Verifica se a atualização foi bem-sucedida
-            if (!$update_result) {
-                $this->writeLog('error', "Falha ao atualizar status da transação PIX para 'refunded'");
-                
-                // Registra o erro no log de reembolso
-                $this->pagou_model->add_refund_log($transaction_id_to_use, [
-                    'action' => 'update_status_failed',
-                    'details' => 'Reembolso aprovado pela API, mas falha ao atualizar status local'
-                ]);
-                
-                echo json_encode([
-                    'status' => 'warning', 
-                    'message' => 'Reembolso processado pela Pagou, mas houve um erro ao atualizar o status interno. Por favor, atualize a página.'
-                ]);
-                return;
-            }
-            
-            $this->writeLog('info', "Status da transação PIX {$transaction_id} atualizado para 'refunded'.");
-
-            // Registra o sucesso no log de reembolso
+        if ($http_code === 204 || $http_code === 200) {
+            // 204 indica apenas que a solicitação foi aceita; a conclusão vem pelo qrcode.refunded
+            $this->pagou_model->update_transaction_pix_status($transaction_id_to_use, 'refund_requested', []);
             $this->pagou_model->add_refund_log($transaction_id_to_use, [
-                'action' => 'refund_success',
+                'action' => 'refund_accepted',
                 'amount' => $refund_amount,
                 'http_code' => $http_code,
-                'api_response' => $response_raw
             ]);
 
-            // Atualiza a fatura -> status=5 (Cancelado)
-            $this->db->where('id', $transaction->invoice_id);
-            $this->db->update(db_prefix() . 'invoices', ['status' => 5]);
-            $this->writeLog('info', "Fatura ID {$transaction->invoice_id} atualizada para status=5 (Cancelado).");
-
-            // Registra a atividade de reembolso no sistema
-            $this->writeActivity("Reembolso PIX realizado para a transação {$transaction_id} no valor de R$ " . 
-                                number_format($refund_amount, 2, ',', '.') . 
-                                " | Cliente: {$transaction->client_company} | Fatura: #{$transaction->invoice_prefix}{$transaction->invoice_number}");
+            $this->writeActivity("Estorno PIX solicitado para a transação {$transaction_id} no valor de R$ " .
+                                number_format($refund_amount, 2, ',', '.') .
+                                " | Fatura: #{$transaction->invoice_prefix}{$transaction->invoice_number}");
 
             echo json_encode([
-                'status' => 'success', 
-                'message' => 'Reembolso PIX realizado com sucesso!',
+                'status' => 'success',
+                'message' => 'Estorno solicitado à Pagou. A fatura será atualizada quando a devolução for confirmada.',
                 'transaction' => [
                     'id' => $transaction_id,
                     'refund_amount' => $refund_amount,
                     'refund_date' => date('d/m/Y H:i:s')
                 ]
             ]);
-        } else {
-            // Falha ao reembolsar
-            $this->writeLog('error', "Erro ao realizar o reembolso PIX para transação ID: {$transaction_id}. HTTP CODE: {$http_code}, Erro cURL: {$error_msg}, Resposta API: {$response_raw}");
-            
-            // Extrai e traduz mensagem de erro
-            $error_message = 'Erro ao realizar reembolso PIX.';
-            $api_error = '';
-            
-            // Tenta extrair mensagem de erro da resposta
-            if (!empty($response_raw)) {
-                $response_data = json_decode($response_raw, true);
-                if (isset($response_data['error'])) {
-                    $api_error = $response_data['error'];
-                    $error_message .= ' ' . $this->translateApiError($api_error);
-                } elseif (isset($response_data['errors']) && is_array($response_data['errors'])) {
-                    $api_error = implode(', ', $response_data['errors']);
-                    $error_message .= ' ' . $this->translateApiError($api_error);
-                }
-            }
-            
-            // Registra falha no log de reembolso
-            $this->pagou_model->add_refund_log($transaction_id_to_use, [
-                'action' => 'refund_failed',
-                'amount' => $refund_amount,
-                'http_code' => $http_code,
-                'api_error' => $api_error,
-                'error_details' => $error_msg ?: $response_raw
-            ]);
-            
-            echo json_encode(['status' => 'error', 'message' => $error_message]);
+            return;
         }
 
-        $this->writeLog('info', 'Finalizando método reembolso_ajax.');
+        $uncertain = ($http_code === 0 || $http_code >= 500 || $http_code === 409);
+        $api_error = '';
+        if (is_array($result['body'])) {
+            $api_error = $result['body']['error'] ?? $result['body']['message'] ?? '';
+            if (is_array($api_error)) {
+                $api_error = implode(', ', $api_error);
+            }
+        }
+
+        $this->pagou_model->add_refund_log($transaction_id_to_use, [
+            'action' => $uncertain ? 'refund_uncertain' : 'refund_failed',
+            'amount' => $refund_amount,
+            'http_code' => $http_code,
+            'api_error' => $api_error,
+        ]);
+
+        if ($uncertain) {
+            // Resultado indeterminado: não repetir sem conferir a cobrança
+            $this->pagou_model->update_transaction_pix_status($transaction_id_to_use, 'refund_requested', []);
+            echo json_encode(['status' => 'warning', 'message' => 'A Pagou não confirmou o recebimento da solicitação. Não repita o estorno: confira a cobrança no painel da Pagou antes.']);
+            return;
+        }
+
+        echo json_encode(['status' => 'error', 'message' => 'Erro ao solicitar estorno PIX. ' . $this->translateApiError($api_error)]);
     }
 
     /**
-     * Endpoint para processar webhooks recebidos da API Pagou.
+     * Requisição à API Pagou com timeout e sem seguir redirecionamentos.
      *
-     * @return void
+     * @param string     $method
+     * @param string     $url
+     * @param string     $api_token
+     * @param array|null $body
+     * @return array ['http_code' => int, 'body' => array|null]
      */
-    public function webhook()
+    private function pagouRequest($method, $url, $api_token, $body = null)
     {
-        // Log de acesso ao webhook
-        $this->writeLog('debug', 'Webhook endpoint accessed');
-        $this->writeLog('debug', 'Request method: ' . $_SERVER['REQUEST_METHOD']);
-        $this->writeLog('debug', 'Headers: ' . json_encode(getallheaders()));
-
-        // Desativa proteção CSRF
-        $this->config->set_item('csrf_protection', FALSE);
-        
-        // Obtenção do payload bruto
-        $payload = file_get_contents('php://input');
-        $this->writeLog('debug', 'Raw payload received: ' . $payload);
-
-        if (empty($payload)) {
-            $this->writeLog('error', 'Payload is empty');
-            $this->output
-                ->set_status_header(400)
-                ->set_content_type('application/json')
-                ->set_output(json_encode(['error' => 'Empty payload']))
-                ->_display();
-            exit;
+        $ch = curl_init($url);
+        $headers = [
+            'Accept: application/json',
+            'User-Agent: pagou-perfex/1.2.1',
+            'X-API-KEY: ' . $api_token,
+        ];
+        if ($body !== null) {
+            $headers[] = 'Content-Type: application/json';
+            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body));
         }
+        curl_setopt_array($ch, [
+            CURLOPT_CUSTOMREQUEST  => $method,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER     => $headers,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_TIMEOUT        => 30,
+            CURLOPT_FOLLOWLOCATION => false,
+        ]);
+        $response = curl_exec($ch);
+        $http_code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
 
-        // Verifica se o método é POST
-        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-            $this->writeLog('error', 'Invalid HTTP method: ' . $_SERVER['REQUEST_METHOD']);
-            $this->output
-                ->set_status_header(405)
-                ->set_header('Allow: POST')
-                ->set_content_type('application/json')
-                ->set_output(json_encode(['error' => 'Method Not Allowed']))
-                ->_display();
-            exit;
-        }
-
-        // Decodifica o payload JSON
-        $data = json_decode($payload);
-        if (!$data) {
-            $this->writeLog('error', 'Invalid JSON payload');
-            $this->output
-                ->set_status_header(400)
-                ->set_content_type('application/json')
-                ->set_output(json_encode(['error' => 'Invalid JSON']))
-                ->_display();
-            exit;
-        }
-        $this->writeLog('debug', 'Decoded JSON payload: ' . json_encode($data));
-
-        // Determina o tipo de pagamento com base no evento
-        $event_name = isset($data->name) ? $data->name : '';
-        $payment_type = (strpos($event_name, 'qrcode') !== false) ? 'pix' : 'boleto';
-        
-        $this->writeLog('info', "Tipo de pagamento determinado: {$payment_type}, Evento: {$event_name}");
-        
-        // Processa o webhook usando a classe apropriada
-        if ($payment_type == 'pix') {
-            // Para eventos de PIX
-            require_once(APPPATH . 'controllers/Pagou_webhook.php');
-            $webhook_handler = new Pagou_webhook();
-            $webhook_handler->process();
-        } else {
-            // Para eventos de Boleto
-            require_once(APPPATH . 'libraries/pagou/Webhook_handler.php');
-            $webhook_handler = new Webhook_handler();
-            $webhook_handler->processWebhook();
-        }
-        
-        // Resposta de sucesso como fallback (não deve chegar aqui normalmente)
-        $this->output
-            ->set_status_header(200)
-            ->set_content_type('application/json')
-            ->set_output(json_encode(['message' => 'Webhook processed']))
-            ->_display();
-        exit;
+        return [
+            'http_code' => $http_code,
+            'body' => ($response !== false && $response !== '') ? json_decode($response, true) : null,
+        ];
     }
 
     /**
@@ -609,7 +524,7 @@ class Pagou extends AdminController
         $this->writeLog('info', 'Acessando página de configurações do Pagou');
         
         // Verifica permissões
-        if (!has_permission('pagou', '', 'view')) {
+        if (!is_admin()) {
             access_denied('Pagou Configurações');
         }
         
@@ -644,6 +559,12 @@ class Pagou extends AdminController
      */
     public function get_pix_transactions()
     {
+        if (!staff_can('access_reembolso', 'pagou_module')) {
+            header('Content-Type: application/json');
+            echo json_encode(['status' => 'error', 'message' => 'Sem permissão para esta ação.']);
+            return;
+        }
+
         $this->writeLog('debug', 'Buscando transações PIX para DataTables');
         
         // Verifica se é uma requisição AJAX
@@ -698,14 +619,18 @@ class Pagou extends AdminController
             $status_class = '';
             $status_icon = '';
             
-            if ($status_db === 'paid' || $status_db === '3') {
+            if ($status_db === 'paid' || $status_db === '4') {
                 $status_display = 'Pago';
                 $status_class = 'success';
                 $status_icon = 'fa-check-circle';
-            } elseif ($status_db === 'pending' || $status_db === '2') {
+            } elseif (in_array($status_db, ['pending', 'active', '1', '2'], true)) {
                 $status_display = 'Pendente';
                 $status_class = 'warning';
                 $status_icon = 'fa-clock-o';
+            } elseif ($status_db === 'refund_requested') {
+                $status_display = 'Estorno solicitado';
+                $status_class = 'info';
+                $status_icon = 'fa-hourglass-half';
             } elseif ($status_db === 'refunded') {
                 $status_display = 'Reembolsado';
                 $status_class = 'danger';
@@ -745,7 +670,7 @@ class Pagou extends AdminController
             
             // Botão de ação
             $action_html = '';
-            if (($status_db === 'paid' || $status_db === '3') && ($payment_method === 'pix')) {
+            if (($status_db === 'paid' || $status_db === '4') && ($payment_method === 'pix')) {
                 $action_html = '<div class="btn-group">
                     <button class="btn btn-success btn-sm" onclick="refundTransaction(\'' . 
                     $transaction->transaction_id . '\', \'' . 
@@ -812,6 +737,12 @@ class Pagou extends AdminController
      * @return void
      */
     public function get_transaction_details() {
+        if (!staff_can('access_reembolso', 'pagou_module')) {
+            header('Content-Type: application/json');
+            echo json_encode(['status' => 'error', 'message' => 'Sem permissão para esta ação.']);
+            return;
+        }
+
         // Verifica se é uma requisição AJAX
         if (!$this->input->is_ajax_request()) {
             show_404();

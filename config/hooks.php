@@ -5,5 +5,4 @@ $hook['post_controller'][] = [
     'filename' => 'Public_pix_avulso.php',
     'filepath' => 'modules/pagou/controllers'
 ];
-$route['pagou_webhook/process/'] = 'admin/pagou/pagou_webhook/process';
 
