@@ -132,12 +132,6 @@
                 <div class="qr-code-container">
                     <img src="data:image/png;base64,<?php echo trim(htmlspecialchars($qr_code_img, ENT_QUOTES, 'UTF-8')); ?>" alt="QR Code PIX">
                 </div>
-            <?php elseif (!empty($qr_code)): ?>
-                <div class="qr-code-container">
-                    <img src="data:image/png;base64,<?php echo trim(htmlspecialchars($qr_code, ENT_QUOTES, 'UTF-8')); ?>" alt="QR Code PIX">
-                </div>
-            <?php else: ?>
-                <p>QR Code não disponível.</p>
             <?php endif; ?>
 
             <!-- Exibir código PIX (texto) -->
@@ -189,18 +183,25 @@
             // Exibir texto formatado para WhatsApp
             function showWhatsAppText() {
                 // Monta o texto usando template literal para preservar quebras de linha e formatações
-                var text = `*Cobrança PIX Avulsa*\n\n` +
-                           `*Detalhes da Cobrança PIX*\n` +
-                           `*Cliente:* <?php echo addslashes($charge->nome); ?>\n` +
-                           `*Descrição:* <?php echo addslashes($charge->descricao); ?>\n\n` +
-                           `*Valor:* R$<?php echo addslashes($charge->valor); ?>\n` +
-                           `*Data de Emissão:* <?php echo addslashes($charge->data_emissao); ?>\n\n` +
-                           `*código PIX abaixo:*\n` +
-                           `<?php echo addslashes($qr_code_text); ?>\n\n` +
-                           `*Instruções:*\n` +
-                           `*1 -* Abra o aplicativo do seu banco e selecione PIX\n` +
-                           `*2 -* Escaneie o QR Code ou cole o código copiado\n` +
-                           `*3 -* Confirme os dados e finalize o pagamento\n`;
+                var d = <?php echo json_encode([
+                    'nome'      => (string) $charge->nome,
+                    'descricao' => (string) $charge->descricao,
+                    'valor'     => number_format((float) $charge->valor, 2, ',', '.'),
+                    'data'      => (string) $charge->data_emissao,
+                    'pix'       => (string) $qr_code_text,
+                ], JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP | JSON_UNESCAPED_UNICODE); ?>;
+                var text = '*Cobrança PIX Avulsa*\n\n' +
+                           '*Detalhes da Cobrança PIX*\n' +
+                           '*Cliente:* ' + d.nome + '\n' +
+                           '*Descrição:* ' + d.descricao + '\n\n' +
+                           '*Valor:* R$ ' + d.valor + '\n' +
+                           '*Data de Emissão:* ' + d.data + '\n\n' +
+                           '*código PIX abaixo:*\n' +
+                           d.pix + '\n\n' +
+                           '*Instruções:*\n' +
+                           '*1 -* Abra o aplicativo do seu banco e selecione PIX\n' +
+                           '*2 -* Escaneie o QR Code ou cole o código copiado\n' +
+                           '*3 -* Confirme os dados e finalize o pagamento\n';
 
                 var container = document.getElementById("whatsAppTextContainer");
                 container.textContent = text;

@@ -68,7 +68,7 @@ class Pagou_model extends App_Model
         }
 
         // Filtro por status (por padrão, mostra todos os status relevantes)
-        if (isset($filters['status'])) {
+        if (isset($filters['status']) && $filters['status'] !== '' && $filters['status'] !== []) {
             if (is_array($filters['status'])) {
                 $this->db->where_in('pix.status', $filters['status']);
             } else {
@@ -117,7 +117,7 @@ class Pagou_model extends App_Model
         }
 
         // Filtro por status (por padrão, mostra apenas os pagos)
-        if (isset($filters['status'])) {
+        if (isset($filters['status']) && $filters['status'] !== '' && $filters['status'] !== []) {
             if (is_array($filters['status'])) {
                 $this->db->where_in('boleto.status', $filters['status']);
             } else {

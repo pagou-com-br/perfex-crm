@@ -83,9 +83,9 @@
                <p><strong><?php echo _l('Data de Emissão:'); ?></strong> <?php echo htmlspecialchars($charge->data_emissao, ENT_QUOTES, 'UTF-8'); ?></p>
                <hr>
                
-               <?php if (!empty($charge->qr_code)): ?>
+               <?php if (!empty($charge->qr_code_img)): ?>
                    <div class="qr-code-container text-center" style="margin-bottom:20px;">
-                       <img src="data:image/png;base64,<?php echo htmlspecialchars($charge->qr_code, ENT_QUOTES, 'UTF-8'); ?>" alt="<?php echo _l('QR Code PIX'); ?>" style="max-width:300px;">
+                       <img src="data:image/png;base64,<?php echo htmlspecialchars($charge->qr_code_img, ENT_QUOTES, 'UTF-8'); ?>" alt="<?php echo _l('QR Code PIX'); ?>" style="max-width:300px;">
                    </div>
                <?php else: ?>
                    <p class="text-center"><?php echo _l('QR Code não disponível.'); ?></p>

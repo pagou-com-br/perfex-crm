@@ -118,7 +118,6 @@ function pagou_adicionar_rotas()
 
     $rotas = [
         "\$route['pagou/notification'] = 'notification/index';",
-        "\$route['pagou/check_payment/(:any)'] = 'pagou/check_payment/\$1';"
     ];
 
     $alterado = false;

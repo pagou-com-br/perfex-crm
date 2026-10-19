@@ -734,7 +734,7 @@ function viewTransactionDetails(transactionId) {
                 } else if (status === 'refunded') {
                     statusHtml = '<span class="label label-danger"><i class="fa fa-undo"></i> Reembolsado</span>';
                 } else {
-                    statusHtml = '<span class="label label-default">' + status + '</span>';
+                    statusHtml = $('<span class="label label-default"></span>').text(status).prop('outerHTML');
                 }
                 
                 $('#status_details').html(statusHtml);
@@ -749,6 +749,7 @@ function viewTransactionDetails(transactionId) {
                     $('#refundHistoryContent').show();
                     
                     var refundHtml = '';
+                    var esc = function (v) { return $('<span></span>').text(v === undefined || v === null ? '' : String(v)).html(); };
                     response.refund_history.forEach(function(log) {
                         var acaoLabel = '';
                         var detalhes = '';
@@ -757,18 +758,26 @@ function viewTransactionDetails(transactionId) {
                         switch(log.action) {
                             case 'refund_requested':
                                 acaoLabel = '<span class="label label-info">Solicitado</span>';
-                                detalhes = 'Motivo: ' + log.description;
+                                detalhes = 'Motivo: ' + esc(log.description);
                                 if (log.staff_name) {
-                                    detalhes += '<br>Por: ' + log.staff_name;
+                                    detalhes += '<br>Por: ' + esc(log.staff_name);
                                 }
                                 break;
                             case 'refund_success':
                                 acaoLabel = '<span class="label label-success">Aprovado</span>';
-                                detalhes = 'HTTP: ' + log.http_code;
+                                detalhes = 'HTTP: ' + esc(log.http_code);
                                 break;
                             case 'refund_failed':
                                 acaoLabel = '<span class="label label-danger">Falha</span>';
-                                detalhes = 'Erro: ' + log.api_error;
+                                detalhes = 'Erro: ' + esc(log.api_error);
+                                break;
+                            case 'refund_accepted':
+                                acaoLabel = '<span class="label label-success">Aceito pela Pagou</span>';
+                                detalhes = 'Aguardando confirmação da devolução';
+                                break;
+                            case 'refund_uncertain':
+                                acaoLabel = '<span class="label label-warning">Sem confirmação</span>';
+                                detalhes = 'Confira no painel da Pagou antes de repetir';
                                 break;
                             case 'refund_webhook':
                                 acaoLabel = '<span class="label label-primary">Webhook</span>';
@@ -776,17 +785,17 @@ function viewTransactionDetails(transactionId) {
                                 break;
                             case 'update_status_failed':
                                 acaoLabel = '<span class="label label-warning">Falha na Atualização</span>';
-                                detalhes = log.details || '';
+                                detalhes = esc(log.details || '');
                                 break;
                             default:
-                                acaoLabel = '<span class="label label-default">' + log.action + '</span>';
+                                acaoLabel = '<span class="label label-default">' + esc(log.action) + '</span>';
                         }
                         
                         // Formata valor
                         var valorFormatado = log.amount ? formatarMoeda(parseFloat(log.amount)) : '---';
                         
                         refundHtml += '<tr>' +
-                            '<td>' + (log.timestamp || '---') + '</td>' +
+                            '<td>' + esc(log.timestamp || '---') + '</td>' +
                             '<td>' + acaoLabel + '</td>' +
                             '<td>R$ ' + valorFormatado + '</td>' +
                             '<td>' + detalhes + '</td>' +

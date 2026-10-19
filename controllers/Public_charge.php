@@ -37,12 +37,26 @@ class Public_charge extends App_Controller {
             exit;
         }
         
+        // Limite de tentativas de CPF por cobrança e sessão (5 a cada 15 minutos)
+        $attempts_key = 'pagou_cpf_attempts_' . md5($link);
+        $attempts = (array) $this->session->userdata($attempts_key);
+        $attempts = array_values(array_filter($attempts, function ($t) { return $t > time() - 900; }));
+        if ($this->input->post('cpf_verify') && count($attempts) >= 5) {
+            $data['error'] = _l('Muitas tentativas. Aguarde alguns minutos e tente de novo.');
+            $data['charge'] = $charge;
+            $_POST = [];
+            $this->load->view('pagou/public_view_charge', $data);
+            return;
+        }
+
         // Se o formulário foi submetido com o CPF para desbloqueio...
         if ($this->input->post('cpf_verify')) {
             $cpf_input = $this->input->post('cpf_verify', true);
             $cpf_input_clean = preg_replace('/\D/', '', $cpf_input);
             $charge_cpf_clean = preg_replace('/\D/', '', $charge->cpf);
-            if ($cpf_input_clean !== $charge_cpf_clean) {
+            if (!hash_equals($charge_cpf_clean, $cpf_input_clean)) {
+                $attempts[] = time();
+                $this->session->set_userdata($attempts_key, $attempts);
                 $data['error'] = _l('CPF inválido. Por favor, tente novamente.');
                 $data['charge'] = $charge;
                 $this->load->view('pagou/public_view_charge', $data);
