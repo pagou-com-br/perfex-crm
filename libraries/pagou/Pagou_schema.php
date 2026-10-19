@@ -49,6 +49,8 @@ class Pagou_schema
         self::add_column($pix, 'payment_method', "varchar(20) DEFAULT 'pix'");
         self::add_column($pix, 'data_pagamento', 'datetime DEFAULT NULL');
         self::add_column($boleto, 'customer_code', 'varchar(100) DEFAULT NULL');
+        self::add_column($pix, 'last_checked_at', 'datetime DEFAULT NULL');
+        self::add_column($boleto, 'last_checked_at', 'datetime DEFAULT NULL');
         self::add_column(db_prefix() . 'pix_avulso', 'qr_code', 'text NULL');
 
         // Pix vinculado das versões anteriores: liga a linha ao boleto pelo qrcode_id

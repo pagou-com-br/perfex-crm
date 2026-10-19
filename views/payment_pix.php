@@ -115,9 +115,11 @@
                             <div class="col-md-12 text-center">
                                 <h4><?php echo htmlspecialchars('Pagamento via PIX', ENT_QUOTES, 'UTF-8'); ?></h4>
                                 <p><?php echo htmlspecialchars('Escaneie o QR Code abaixo com o aplicativo do seu banco', ENT_QUOTES, 'UTF-8'); ?></p>
+                                <?php if (!empty($qr_code)): ?>
                                 <div class="qr-code-container">
                                     <img src="data:image/png;base64,<?php echo htmlspecialchars($qr_code, ENT_QUOTES, 'UTF-8'); ?>" alt="<?php echo htmlspecialchars('QR Code PIX', ENT_QUOTES, 'UTF-8'); ?>" style="max-width: 300px;">
                                 </div>
+                                <?php endif; ?>
                                 <p class="text-muted"><?php echo htmlspecialchars('ou', ENT_QUOTES, 'UTF-8'); ?></p>
                                 <p><?php echo htmlspecialchars('Copie o código PIX abaixo:', ENT_QUOTES, 'UTF-8'); ?></p>
                                 <div class="form-group">
@@ -210,8 +212,7 @@
             return;
         }
         
-        const invoiceId = <?php echo $invoice->id; ?>;
-        fetch(`<?php echo site_url('pagou/check_payment_status/'); ?>${invoiceId}`, {
+        fetch(<?php echo json_encode(site_url('pagou/payment_status/check/' . (int) $invoice->id . '/' . $invoice->hash)); ?>, {
             method: 'GET',
             headers: {
                 'Content-Type': 'application/json',

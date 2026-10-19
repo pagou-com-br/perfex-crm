@@ -1,156 +1,69 @@
 <?php
 defined('BASEPATH') or exit('No direct script access allowed');
 
-
+/**
+ * Gateway Pix da Pagou para faturas do Perfex.
+ *
+ * Imediato: POST /v1/pix (validade em segundos, sem encargos).
+ * Com vencimento: POST /v1/pix/due (validade em dias após o vencimento, multa, juros e desconto).
+ * A confirmação do pagamento vem do webhook autenticado ou da consulta (Pagou_events).
+ */
 class Pagou_pix_gateway extends App_gateway
 {
-    protected $ci;
-    private $enable_logs;
+    const INTEREST_TYPES = [
+        'percentage_month_calendar_days' => 'Percentual ao mês (dias corridos)',
+        'percentage_month_working_days'  => 'Percentual ao mês (dias úteis)',
+        'percentage_calendar_days'       => 'Percentual ao dia (dias corridos)',
+        'percentage_working_days'        => 'Percentual ao dia (dias úteis)',
+        'fixed_calendar_days'            => 'Reais por dia corrido',
+        'fixed_working_days'             => 'Reais por dia útil',
+        'percentage_year_calendar_days'  => 'Percentual ao ano (dias corridos)',
+        'percentage_year_working_days'   => 'Percentual ao ano (dias úteis)',
+    ];
 
+    protected $ci;
 
     public function __construct()
     {
         parent::__construct();
-
         $this->ci = &get_instance();
         $this->ci->load->database();
 
         $this->setId('pagou_pix');
         $this->setName('Pagou.com.br PIX');
 
-        $option = $this->ci->db->get_where(db_prefix() . 'options', ['name' => 'pagou_logs_api'])->row();
-        $this->enable_logs = ($option && $option->value === '1');
-
-        $this->log('info', 'Pagou_pix_gateway (v1.8) inicializado. Logs ' . ($this->enable_logs ? 'ativados' : 'desativados') . '.');
+        $interest_options = [];
+        foreach (self::INTEREST_TYPES as $value => $label) {
+            $interest_options[] = ['value' => $value, 'label' => $label];
+        }
 
         $this->setSettings([
-            // ==== SEÇÃO API ====
-            [
-                'name'      => 'api_token',
-                'encrypted' => true,
-                'label'     => 'API | Token Pagou.com.br (Obrigatório)',
-                'type'      => 'input'
-            ],
-            [
-                'name'    => 'is_production',
-                'label'   => 'AMBIENTE | Produção? (SIM = transações reais, NÃO = ambiente de testes)',
-                'type'    => 'yes_no',
-                'default_value' => 1
-            ],
-            [
-                'name'          => 'expiration',
-                'label'         => 'QR CODE | Validade em minutos (Ex: 60 = 1h, 1440 = 24h, Máx: 43200)',
-                'type'          => 'input',
-                'default_value' => '1440'
-            ],
-            [
-                'name'          => 'currencies',
-                'label'         => 'MOEDA | Códigos aceitos (geralmente apenas BRL para PIX)',
-                'type'          => 'input',
-                'default_value' => 'BRL'
-            ],
-            [
-                'name'    => 'enable_logs',
-                'label'   => 'LOGS | Ativar registro detalhado de logs da integração',
-                'type'    => 'yes_no',
-                'default_value' => 0
-            ],
-            [
-                'name'    => 'log_detailed',
-                'label'   => 'LOGS | Ativar registro super detalhado (incluir payload completo)',
-                'type'    => 'yes_no',
-                'default_value' => 0
-            ],
-            
-            // ==== SEÇÃO DESCONTOS ====
-            [
-                'name'    => 'enable_discount',
-                'label'   => '━━━━━━━━━━━━━━━━ DESCONTOS ━━━━━━━━━━━━━━━━',
-                'type'    => 'yes_no',
-                'default_value' => 0
-            ],
-            [
-                'name'    => 'discount_type',
-                'label'   => '     ⤷ Tipo: digite "fixed" (valor fixo) ou "percentage" (percentual)',
-                'type'    => 'input',
-                'default_value' => 'fixed'
-            ],
-            [
-                'name'          => 'discount_value',
-                'label'         => '     ⤷ Valor: se fixed=centavos (500=R$5,00), se percentage=% (10=10%)',
-                'type'          => 'input',
-                'default_value' => '0'
-            ],
-            
-            // ==== SEÇÃO MULTAS ====
-            [
-                'name'    => 'enable_fine',
-                'label'   => '━━━━━━━━━━━━━━━━ MULTA POR ATRASO ━━━━━━━━━━━━━━━━',
-                'type'    => 'yes_no',
-                'default_value' => 0
-            ],
-            [
-                'name'          => 'fine_days_after_due',
-                'label'         => '     ⤷ Aplicar após quantos dias do vencimento (0=mesmo dia, 1=dia seguinte)',
-                'type'          => 'input',
-                'default_value' => '1'
-            ],
-            [
-                'name'    => 'fine_type',
-                'label'   => '     ⤷ Tipo: digite "fixed" (valor fixo) ou "percentage" (percentual)',
-                'type'    => 'input',
-                'default_value' => 'fixed'
-            ],
-            [
-                'name'          => 'fine_value',
-                'label'         => '     ⤷ Valor: se fixed=centavos (200=R$2,00), se percentage=% (2=2%)',
-                'type'          => 'input',
-                'default_value' => '0'
-            ],
-            
-            // ==== SEÇÃO JUROS ====
-            [
-                'name'    => 'enable_interest',
-                'label'   => '━━━━━━━━━━━━━━━━ JUROS POR ATRASO ━━━━━━━━━━━━━━━━',
-                'type'    => 'yes_no',
-                'default_value' => 0
-            ],
-            [
-                'name'          => 'interest_days_after_due',
-                'label'         => '     ⤷ Aplicar após quantos dias do vencimento (0=mesmo dia, 1=dia seguinte)',
-                'type'          => 'input',
-                'default_value' => '1'
-            ],
-            [
-                'name'    => 'interest_type',
-                'label'   => '     ⤷ Tipo: digite "daily_percentage" (percentual ao dia)',
-                'type'    => 'input',
-                'default_value' => 'daily_percentage'
-            ],
-            [
-                'name'          => 'interest_value',
-                'label'         => '     ⤷ Valor: percentual diário (Ex: 0.1 = 0,1% ao dia)',
-                'type'          => 'input',
-                'default_value' => '0'
-            ],
-            
-            // ==== SEÇÃO WEBHOOK ====
-            [
-                'name'    => 'webhook_section',
-                'label'   => '━━━━━━━━━━━━━━━━ CONFIGURAÇÃO DE WEBHOOK ━━━━━━━━━━━━━━━━',
-                'type'    => 'info'
-            ],
-            [
-                'name'          => 'webhook_url',
-                'label'         => '     ⤷ URL de Webhook (deixe em branco para usar a padrão)',
-                'type'          => 'input',
-                'default_value' => ''
-            ],
+            ['name' => 'api_token', 'encrypted' => true, 'label' => 'API | Chave de API da Pagou (do mesmo ambiente escolhido abaixo)', 'type' => 'input'],
+            ['name' => 'is_production', 'label' => 'AMBIENTE | Produção? (NÃO = Sandbox, para testes)', 'type' => 'yes_no', 'default_value' => 0],
+            ['name' => 'pix_mode', 'label' => 'TIPO DE PIX | "immediate" = QR Code imediato; "due" = Pix com vencimento da fatura (permite multa, juros e desconto)', 'type' => 'input', 'default_value' => 'immediate'],
+            ['name' => 'expiration', 'label' => 'PIX IMEDIATO | Validade do QR Code em minutos (mínimo 1)', 'type' => 'input', 'default_value' => '1440'],
+            ['name' => 'due_expiration_days', 'label' => 'PIX COM VENCIMENTO | Dias em que o Pix continua pagável após o vencimento (mínimo 1)', 'type' => 'input', 'default_value' => '30'],
+            ['name' => 'currencies', 'label' => 'MOEDA | Códigos aceitos', 'type' => 'input', 'default_value' => 'BRL'],
+            ['name' => 'enable_logs', 'label' => 'LOGS | Registrar logs da integração (dados sensíveis são mascarados)', 'type' => 'yes_no', 'default_value' => 0],
+
+            ['name' => 'enable_discount', 'label' => '━━━━ DESCONTO (só Pix com vencimento) ━━━━', 'type' => 'yes_no', 'default_value' => 0],
+            ['name' => 'discount_type', 'label' => '     ⤷ Tipo: "fixed" (reais) ou "percentage" (%)', 'type' => 'input', 'default_value' => 'fixed'],
+            ['name' => 'discount_value', 'label' => '     ⤷ Valor: em reais (5.00 = R$ 5,00) ou em % (10 = 10%)', 'type' => 'input', 'default_value' => '0'],
+            ['name' => 'discount_days_before', 'label' => '     ⤷ Válido até quantos dias antes do vencimento (0 = até o vencimento)', 'type' => 'input', 'default_value' => '0'],
+
+            ['name' => 'enable_fine', 'label' => '━━━━ MULTA POR ATRASO (só Pix com vencimento) ━━━━', 'type' => 'yes_no', 'default_value' => 0],
+            ['name' => 'fine_type', 'label' => '     ⤷ Tipo: "fixed" (reais) ou "percentage" (%)', 'type' => 'input', 'default_value' => 'percentage'],
+            ['name' => 'fine_value', 'label' => '     ⤷ Valor: em reais ou em % (2 = 2%)', 'type' => 'input', 'default_value' => '0'],
+
+            ['name' => 'enable_interest', 'label' => '━━━━ JUROS POR ATRASO (só Pix com vencimento) ━━━━', 'type' => 'yes_no', 'default_value' => 0],
+            ['name' => 'interest_type', 'label' => '     ⤷ Tipo: ' . implode(', ', array_keys(self::INTEREST_TYPES)), 'type' => 'input', 'default_value' => 'percentage_month_calendar_days'],
+            ['name' => 'interest_value', 'label' => '     ⤷ Valor conforme o tipo (ex.: 1 = 1% ao mês)', 'type' => 'input', 'default_value' => '0'],
+
+            ['name' => 'webhook_url', 'label' => 'WEBHOOK | URL personalizada (deixe em branco para usar a padrão do módulo)', 'type' => 'input', 'default_value' => ''],
         ]);
-        
+
         hooks()->add_action('before_add_payment_gateway', [$this, 'register_gateway']);
     }
-
 
     public function register_gateway()
     {
@@ -160,660 +73,339 @@ class Pagou_pix_gateway extends App_gateway
     public function init_settings()
     {
         parent::init_settings();
-        
-        if ($this->getSetting('enable_logs') === '1') {
-            update_option('pagou_logs_api', '1');
-            $this->enable_logs = true;
-        } else {
-            update_option('pagou_logs_api', '0');
-            $this->enable_logs = false;
-        }
+        update_option('pagou_logs_api', $this->getSetting('enable_logs') === '1' ? '1' : '0');
     }
 
-
+    /**
+     * Mantido por compatibilidade com chamadas antigas (Pix avulso).
+     */
     public function log($level, $message, $data = null)
     {
-        if ($this->enable_logs) {
-            $log_message = "[Pagou PIX Gateway] " . $message;
-            
-            $timestamp = date('Y-m-d H:i:s');
-            $log_message = "[{$timestamp}] " . $log_message;
-            
-            if ($data !== null) {
-                if (is_array($data) || is_object($data)) {
-                    $log_message .= " | Dados: " . json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
-                } else {
-                    $log_message .= " | Dados: " . $data;
-                }
-            }
-            
-            log_message($level, $log_message);
-            
-            $log_file = APPPATH . 'logs/pagou_pix_' . date('Y-m-d') . '.log';
-            error_log($log_message . PHP_EOL, 3, $log_file);
-        }
+        pagou_log('pix', $level, $message, $data === null ? [] : ['data' => $data]);
     }
 
+    // ================================================================ pagamento
 
     public function process_payment($data)
     {
-        $this->log('debug', 'Método process_payment iniciado.');
-
         if (empty($data['invoice'])) {
-            $this->log('error', 'Nenhuma fatura informada para process_payment.');
             set_alert('danger', _l('invoice_not_found'));
             redirect(site_url());
-            return;
+            return false;
         }
 
+        pagou_load_libraries();
         $invoice = $data['invoice'];
-        $this->log('debug', 'Processando pagamento para a Fatura Perfex ID: ' . $invoice->id . ', Número: ' . format_invoice_number($invoice->id));
+        $back = site_url('invoice/' . $invoice->id . '/' . $invoice->hash);
 
-        $this->ensure_table_exists();
-
-
-        $this->ci->db->where('invoice_id', $invoice->id);
-        $this->ci->db->where_in('status', ['paid', 'confirmed', 'refund_requested']);
-        $paid_transaction = $this->ci->db->get(db_prefix() . 'pagou_transactions_pix')->row();
-
-        if ($paid_transaction) {
-            $this->log('info', "A Fatura ID: " . $invoice->id . " já possui um pagamento confirmado (ID Pagou: {$paid_transaction->transaction_id}). Não é permitido criar novo PIX.");
-            
-
-            $view_data = [
-                'invoice'             => $invoice,
-                'qr_code'             => $paid_transaction->qr_code,
-                'qr_code_text'        => $paid_transaction->qr_code_text,
-                'date_created'        => $paid_transaction->date_created,
-                'expiration_seconds'  => $paid_transaction->expiration_seconds,
-                'pagou_transaction_id' => $paid_transaction->transaction_id
-            ];
-            $this->ci->load->view('pagou/payment_pix', $view_data);
-            return;
+        if (!Pagou_schema::ready()) {
+            return $this->fail($back, 'O pagamento por Pix está temporariamente indisponível.');
         }
 
-        // Reaproveita só o Pix próprio da fatura (o Pix vinculado ao boleto tem linha separada)
-        pagou_ensure_schema_121();
-        $this->ci->db->where('invoice_id', $invoice->id);
-        $this->ci->db->where('boleto_transaction_id IS NULL', null, false);
-        $this->ci->db->where_not_in('status', ['paid', 'confirmed', 'expired', 'refund_requested', 'refunded', 'cancelled', 'removed']);
-        $this->ci->db->order_by('id', 'DESC');
-        $active_transaction = $this->ci->db->get(db_prefix() . 'pagou_transactions_pix')->row();
+        if (!pagou_invoice_is_open($invoice)) {
+            return $this->fail($back, 'Esta fatura não está aberta para pagamento.');
+        }
 
-        if ($active_transaction) {
-            $date_created = new DateTime($active_transaction->date_created);
-            $expiration_seconds = $active_transaction->expiration_seconds ?? (intval($this->getSetting('expiration')) * 60);
-            $date_created->add(new DateInterval('PT' . $expiration_seconds . 'S'));
-            $now = new DateTime();
-            
-            if ($date_created < $now) {
-                $this->log('info', "Transação existente (ID Pagou: {$active_transaction->transaction_id}) para a Fatura ID: " . $invoice->id . " está expirada. Criando novo QR Code.");
-                $this->ci->db->where('id', $active_transaction->id);
-                $this->ci->db->update(db_prefix() . 'pagou_transactions_pix', ['status' => 'expired']);
-            } else {
-                $this->log('info', "Transação existente e não expirada (ID Pagou: {$active_transaction->transaction_id}) encontrada para a Fatura ID: " . $invoice->id . ". Reutilizando QR Code.");
-                $view_data = [
-                    'invoice'            => $invoice,
-                    'qr_code'            => $active_transaction->qr_code,
-                    'qr_code_text'       => $active_transaction->qr_code_text,
-                    'date_created'       => $active_transaction->date_created,
-                    'expiration_seconds' => $expiration_seconds,
-                    'pagou_transaction_id' => $active_transaction->transaction_id
-                ];
-                $this->ci->load->view('pagou/payment_pix', $view_data);
-                return;
+        $amount = pagou_invoice_amount_due($invoice);
+        if ($amount <= 0) {
+            return $this->fail($back, 'Esta fatura não tem valor em aberto.');
+        }
+
+        $api = Pagou_api::for_gateway($this->getId());
+        if (!$api) {
+            return $this->fail($back, 'O pagamento por Pix está indisponível no momento.');
+        }
+
+        // Uma emissão por vez para a mesma fatura (cliques duplos, abas simultâneas)
+        $lock = 'pagou_pix_invoice_' . $invoice->id;
+        $this->ci->db->query('SELECT GET_LOCK(?, 10) AS l', [$lock]);
+        try {
+            $row = $this->current_charge($api, $invoice, $amount);
+            if ($row === false) {
+                return $this->fail($back, 'Não foi possível confirmar uma cobrança Pix anterior. Tente novamente em instantes.');
+            }
+            if (!$row) {
+                $row = $this->create_charge($api, $invoice, $amount, $error);
+                if (!$row) {
+                    return $this->fail($back, $error);
+                }
+            }
+        } finally {
+            $this->ci->db->query('SELECT RELEASE_LOCK(?)', [$lock]);
+        }
+
+        $this->ci->load->view('pagou/payment_pix', [
+            'invoice'              => $invoice,
+            'qr_code'              => $row->qr_code,
+            'qr_code_text'         => $row->qr_code_text,
+            'date_created'         => $row->date_created,
+            'expiration_seconds'   => $row->expiration_seconds,
+            'pagou_transaction_id' => $row->transaction_id,
+        ]);
+
+        return true;
+    }
+
+    /**
+     * Pix reaproveitável da fatura, null para criar outro, false quando não deu para decidir.
+     */
+    private function current_charge(Pagou_api $api, $invoice, $amount)
+    {
+        $table = db_prefix() . 'pagou_transactions_pix';
+        $rows = $this->ci->db->where('invoice_id', $invoice->id)
+            ->where('boleto_transaction_id IS NULL', null, false)
+            ->where_in('status', ['creating', 'uncertain', 'pending', 'active', '1', '2'])
+            ->order_by('id', 'DESC')
+            ->get($table)->result();
+
+        foreach ($rows as $row) {
+            if (in_array($row->status, ['creating', 'uncertain'], true)) {
+                $adopted = $this->recover_uncertain($api, $row);
+                if ($adopted === false) {
+                    return false;
+                }
+                if ($adopted === null) {
+                    continue; // não foi criada na Pagou
+                }
+                $row = $adopted;
+            }
+
+            $expired = strtotime($row->date_created) + (int) $row->expiration_seconds <= time() + 60;
+            $same_amount = abs((float) $row->amount - $amount) < 0.005;
+            if (!$expired && $same_amount && $row->qr_code_text !== '') {
+                return $row;
+            }
+
+            // Vencido ou com valor diferente: cancela antes de emitir outro
+            $cancel = $api->cancel_pix($row->transaction_id);
+            if ($cancel->http_code === 204 || $cancel->not_found()) {
+                $this->ci->db->where('id', $row->id)->update($table, ['status' => $expired ? 'expired' : 'cancelled']);
+                continue;
+            }
+            $check = $api->get_pix($row->transaction_id);
+            $status = $check->ok() ? (int) ($check->body['status'] ?? 0) : 0;
+            if ($status === 4) {
+                // Pago enquanto isso: a baixa vem pelo processador de eventos
+                pagou_load_libraries();
+                (new Pagou_events())->settle_pix($row);
+                return false;
+            }
+            if (in_array($status, [3, 6], true)) {
+                $this->ci->db->where('id', $row->id)->update($table, ['status' => pagou_normalize_status($status)]);
+                continue;
+            }
+
+            return false;
+        }
+
+        return null;
+    }
+
+    /**
+     * Criação com resultado indeterminado: procura pelo customer_code antes de emitir outra.
+     *
+     * @return object|null|false Linha adotada, null se não existe na Pagou, false se a busca falhou
+     */
+    private function recover_uncertain(Pagou_api $api, $row)
+    {
+        $table = db_prefix() . 'pagou_transactions_pix';
+        $from = strtotime($row->date_created) - 300;
+        $list = $api->list_pix([
+            'created_at_from' => pagou_utc_filter_time($from),
+            'created_at_to'   => pagou_utc_filter_time(time() + 60),
+            'limit'           => 100,
+            'offset'          => 0,
+        ]);
+        if (!$list->ok()) {
+            return false;
+        }
+
+        foreach ((array) $list->body as $item) {
+            if (is_array($item) && ($item['customer_code'] ?? '') === $row->customer_code && !empty($item['id'])) {
+                $full = $api->get_pix($item['id']);
+                $body = $full->ok() && is_array($full->body) ? $full->body : $item;
+                $this->ci->db->where('id', $row->id)->update($table, [
+                    'transaction_id' => $item['id'],
+                    'qr_code'        => $body['payload']['image'] ?? '',
+                    'qr_code_text'   => $body['payload']['data'] ?? '',
+                    'status'         => pagou_normalize_status($body['status'] ?? 1),
+                    'api_response'   => json_encode(pagou_redact($body)),
+                ]);
+                return $this->ci->db->where('id', $row->id)->get($table)->row();
             }
         }
 
-        $amount_formatted = round($invoice->total, 2);
-        
+        // Só descarta depois de tempo suficiente para a cobrança aparecer na listagem
+        if (time() - strtotime($row->date_created) < 120) {
+            return false;
+        }
+        $this->ci->db->where('id', $row->id)->update($table, ['status' => 'failed']);
+
+        return null;
+    }
+
+    private function create_charge(Pagou_api $api, $invoice, $amount, &$error)
+    {
+        $payer_name = mb_substr($this->client_name($invoice), 0, 100);
+        $document = $this->client_document($invoice);
+        if (!pagou_valid_document($document)) {
+            $error = 'Para pagar por Pix, o cadastro precisa de um CPF ou CNPJ válido. Atualize o campo CPF/CNPJ (VAT) do cliente.';
+            return null;
+        }
+
+        $mode = $this->getSetting('pix_mode') === 'due' ? 'due' : 'immediate';
         $description = hooks()->apply_filters(
             'pagou_pix_description',
-            'Pagamento Fatura Perfex CRM #' . format_invoice_number($invoice->id) . ' (Cliente: ' . ($invoice->client->company ?? 'Cliente') . ')',
+            'Fatura ' . format_invoice_number($invoice->id),
             $invoice
         );
+        $notification_url = trim((string) $this->getSetting('webhook_url'));
 
-        $expiration_minutes = (int) $this->getSetting('expiration');
-        $expiration_seconds = max(60, min($expiration_minutes * 60, 2592000)); 
-
-        $client_name = $this->get_client_name($invoice);
-        $client_document = $this->get_client_document($invoice);
-        $client_email = $this->get_client_email($invoice);
-
-        $custom_webhook_url = trim($this->getSetting('webhook_url'));
-        $notification_url = !empty($custom_webhook_url) ? $custom_webhook_url : site_url('pagou/pagou_webhook/process');
-        
-        $this->log('debug', 'URL de Notificação configurada: ' . $notification_url);
-
-        $external_id = $this->generate_external_id($invoice->id);
-
-        $payment_data = [
-            'amount'           => $amount_formatted,
-            'description'      => mb_substr($description, 0, 140),
-            'expiration'       => $expiration_seconds,
-            'notification_url' => $notification_url,
-            'external_id'      => $external_id,
-            'payer'            => [
-                'name'     => mb_substr($client_name, 0, 100),
-                'document' => preg_replace('/[^0-9]/', '', $client_document),
+        $body = [
+            'amount'      => $amount,
+            'description' => mb_substr($description, 0, 140),
+            'payer'       => ['name' => $payer_name, 'document' => $document],
+            'metadata'    => [
+                ['key' => 'invoice_id', 'value' => (string) $invoice->id],
+                ['key' => 'invoice_number', 'value' => (string) format_invoice_number($invoice->id)],
+                ['key' => 'source', 'value' => 'perfex_crm'],
             ],
-        ];
-        
-        if (!empty($client_email)) {
-            $payment_data['payer']['email'] = $client_email;
-        }
-
-        $payment_data['metadata'] = [
-            [
-                'key' => 'invoice_id',
-                'value' => (string) $invoice->id
-            ],
-            [
-                'key' => 'invoice_number',
-                'value' => format_invoice_number($invoice->id)
-            ],
-            [
-                'key' => 'client_id',
-                'value' => (string) $invoice->clientid
-            ],
-            [
-                'key' => 'source',
-                'value' => 'perfex_crm'
-            ]
+            'notification_url' => $notification_url !== '' ? $notification_url : site_url('pagou/pagou_webhook/process'),
         ];
 
-        if ($this->getSetting('enable_discount') === '1') {
-            $discount_value_input = $this->getSetting('discount_value');
-            if (is_numeric($discount_value_input) && $discount_value_input > 0) {
-                $discount_type = $this->getSetting('discount_type');
-                if (!in_array($discount_type, ['fixed', 'percentage'])) {
-                    $discount_type = 'fixed'; 
-                    $this->log('warning', 'Tipo de desconto inválido na configuração. Usando "fixed" como padrão.');
-                }
-                
-                $api_discount_value = ($discount_type === 'fixed') ? (int) $discount_value_input : floatval(str_replace(',', '.', $discount_value_input));
-                $payment_data['discount'] = [
-                    'type'  => $discount_type,
-                    'value' => $api_discount_value,
-                ];
-                $this->log('debug', 'Desconto configurado para API:', $payment_data['discount']);
-            }
-        }
-
-        if ($this->getSetting('enable_fine') === '1' && !empty($invoice->duedate)) {
-            $fine_value_input = $this->getSetting('fine_value');
-             if (is_numeric($fine_value_input) && $fine_value_input > 0) {
-                $fine_days_after_due = max(0, (int) $this->getSetting('fine_days_after_due'));
-                try {
-                    $due_date = new DateTime($invoice->duedate);
-                    $fine_date_obj = clone $due_date;
-                    $fine_date_obj->add(new DateInterval("P{$fine_days_after_due}D")); 
-                    
-                    $fine_type = $this->getSetting('fine_type');
-                    if (!in_array($fine_type, ['fixed', 'percentage'])) {
-                        $fine_type = 'fixed'; 
-                        $this->log('warning', 'Tipo de multa inválido na configuração. Usando "fixed" como padrão.');
-                    }
-                    
-                    $api_fine_value = ($fine_type === 'fixed') ? (int) $fine_value_input : floatval(str_replace(',', '.', $fine_value_input));
-
-                    $payment_data['fine'] = [
-                        'date'  => $fine_date_obj->format('Y-m-d'),
-                        'type'  => $fine_type,
-                        'value' => $api_fine_value,
-                    ];
-                    $this->log('debug', 'Multa configurada para API:', $payment_data['fine']);
-                } catch (\Throwable $e) {
-                    $this->log('error', 'Erro ao calcular data da multa: ' . $e->getMessage());
-                }
-            }
-        }
-        
-        if ($this->getSetting('enable_interest') === '1' && !empty($invoice->duedate)) {
-            $interest_value_input = $this->getSetting('interest_value');
-            if (is_numeric($interest_value_input) && $interest_value_input > 0) {
-                $interest_days_after_due = max(0, (int) $this->getSetting('interest_days_after_due'));
-                try {
-                    $due_date = new DateTime($invoice->duedate);
-                    $interest_date_obj = clone $due_date;
-                    $interest_date_obj->add(new DateInterval("P{$interest_days_after_due}D"));
-
-                    $interest_type = $this->getSetting('interest_type');
-                    if ($interest_type !== 'daily_percentage') {
-                        $this->log('warning', 'Tipo de juros inválido ou não suportado na configuração. Usando "daily_percentage" como padrão.');
-                        $interest_type = 'daily_percentage';
-                    }
-                    
-                    $api_interest_value = floatval(str_replace(',', '.', $interest_value_input));
-
-                    $payment_data['interest'] = [
-                        'date'  => $interest_date_obj->format('Y-m-d'),
-                        'type'  => $interest_type,
-                        'value' => $api_interest_value,
-                    ];
-                    $this->log('debug', 'Juros configurados para API:', $payment_data['interest']);
-                } catch (\Throwable $e) {
-                    $this->log('error', 'Erro ao calcular data dos juros: ' . $e->getMessage());
-                }
-            }
-        }
-
-        $this->log('debug', 'Payload final para API Pagou:', $payment_data);
-
-        $is_production = $this->getSetting('is_production') === '1';
-        $environment = $is_production ? 'production' : 'sandbox';
-        
-        $api_endpoint = pagou_api_base_url($is_production) . '/v1/pix';
-        
-        $this->log('debug', 'API endpoint selecionado: ' . $api_endpoint . ' (Ambiente: ' . $environment . ')');
-
-        $this->log('info', "=== INÍCIO DA REQUISIÇÃO PARA API PAGOU ===");
-        $this->log('debug', 'URL da API', $api_endpoint);
-        $this->log('debug', 'Método HTTP', 'POST');
-        $this->log('debug', 'Cabeçalhos enviados', [
-            'Content-Type: application/json',
-            'X-API-KEY: [REDACTED]' 
-        ]);
-        $this->log('debug', 'Payload enviado (corpo da requisição)', $payment_data);
-
-        $ch = curl_init($api_endpoint);
-        curl_setopt($ch, CURLOPT_POST, 1);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payment_data));
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-    'Content-Type: application/json',
-    'X-API-KEY: ' . $this->decryptSetting('api_token'),
-    'User-Agent: PerfexCRM/PagouPix/1.8'  
-]);
-        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 20); 
-        curl_setopt($ch, CURLOPT_TIMEOUT, 40);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
-        
-
-        $response_body = curl_exec($ch);
-        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $content_type = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
-        $total_time = curl_getinfo($ch, CURLINFO_TOTAL_TIME);
-        $curl_error = curl_error($ch);
-        curl_close($ch);
-
-        $this->log('debug', 'Tempo total da requisição', $total_time . ' segundos');
-        $this->log('debug', 'Código HTTP recebido', $http_code);
-        $this->log('debug', 'Tipo de conteúdo recebido', $content_type);
-        $this->log('debug', 'Corpo da resposta recebida', $response_body);
-
-        if ($curl_error) {
-            $this->log('error', 'Erro cURL ao chamar API Pagou', $curl_error);
-        }
-
-        $this->log('info', "=== FIM DA REQUISIÇÃO PARA API PAGOU ===");
-        
-        if ($curl_error) {
-            $this->log('error', 'Erro cURL ao chamar API Pagou: ' . $curl_error);
-            set_alert('danger', 'Erro de comunicação com o gateway de pagamento. Detalhes: ' . $curl_error);
-            redirect(site_url('invoice/' . $invoice->id . '/' . $invoice->hash));
-            return;
-        }
-
-        if ($http_code === 201) {
-            $this->log('info', 'PIX gerado com sucesso pela Pagou (HTTP 201).');
-            $result = json_decode($response_body);
-
-            if (!$result || !isset($result->payload->image) || !isset($result->payload->data) || !isset($result->id)) {
-                $this->log('error', 'Resposta da API Pagou em formato inesperado: ' . $response_body);
-                set_alert('danger', 'Erro ao processar resposta do gateway de pagamento. Formato inesperado.');
-                redirect(site_url('invoice/' . $invoice->id . '/' . $invoice->hash));
-                return;
-            }
-            
-            $db_transaction_data = [
-                'invoice_id'         => $invoice->id,
-                'cliente'            => $client_name,
-                'doc'                => $client_document,
-                'transaction_id'     => $result->id,
-                'payment_method'     => 'pix',  
-                'qr_code'            => $result->payload->image,
-                'qr_code_text'       => $result->payload->data,
-                'amount'             => $invoice->total,
-                'amount_final'       => $invoice->total,
-                'status'             => $result->status ?? 'pending',
-                'date_created'       => date('Y-m-d H:i:s'),
-                'expiration_seconds' => $expiration_seconds,
-                'api_request'        => json_encode($payment_data),
-                'api_response'       => $response_body,
-                'external_id'        => $external_id,
-            ];
-            
-            $this->ci->db->insert(db_prefix() . 'pagou_transactions_pix', $db_transaction_data);
-            $local_transaction_id = $this->ci->db->insert_id();
-            $this->log('info', "Transação PIX registrada no banco local (ID: {$local_transaction_id}, Pagou ID: {$result->id}).");
-
-            $view_data = [
-                'invoice'            => $invoice,
-                'qr_code'            => $result->payload->image,
-                'qr_code_text'       => $result->payload->data,
-                'date_created'       => $db_transaction_data['date_created'],
-                'expiration_seconds' => $expiration_seconds,
-                'pagou_transaction_id' => $result->id
-            ];
-            $this->ci->load->view('pagou/payment_pix', $view_data);
-            $this->log('info', 'View de pagamento PIX carregada para o cliente.');
-
+        if ($mode === 'due') {
+            $due_date = pagou_effective_due_date($invoice->duedate);
+            $days = max(1, (int) $this->getSetting('due_expiration_days'));
+            $body['due_date'] = $due_date;
+            $body['expiration'] = $days;
+            $body += $this->charges($due_date);
+            $expiration_seconds = max(60, strtotime($due_date . ' 23:59:59 +' . $days . ' days') - time());
         } else {
-            $error_message_from_api = 'Erro desconhecido da API Pagou.';
-            if ($response_body) {
-                $result = json_decode($response_body);
-                $error_message_from_api = $this->parsePagouError($result, $response_body);
-            }
-            $this->log('error', "Erro ao gerar PIX na Pagou. HTTP Code: {$http_code}. API Message: {$error_message_from_api}. Raw Response: {$response_body}");
-            set_alert('danger', 'Erro ao gerar PIX junto ao gateway: ' . $error_message_from_api . ' (Código Pagou: ' . $http_code . ')');
-            redirect(site_url('invoice/' . $invoice->id . '/' . $invoice->hash));
+            $expiration_seconds = max(60, (int) $this->getSetting('expiration') * 60);
+            $body['expiration'] = $expiration_seconds;
         }
-    }
-    
 
-    private function generate_external_id($invoice_id) {
+        // Linha local antes da chamada: permite reconciliar se o resultado for indeterminado
+        $table = db_prefix() . 'pagou_transactions_pix';
+        $this->ci->db->insert($table, [
+            'invoice_id'         => $invoice->id,
+            'cliente'            => $payer_name,
+            'doc'                => $document,
+            'transaction_id'     => 'creating-' . bin2hex(random_bytes(8)),
+            'payment_method'     => 'pix',
+            'qr_code'            => '',
+            'qr_code_text'       => '',
+            'amount'             => $amount,
+            'amount_final'       => $amount,
+            'status'             => 'creating',
+            'date_created'       => date('Y-m-d H:i:s'),
+            'expiration_seconds' => $expiration_seconds,
+        ]);
+        $row_id = $this->ci->db->insert_id();
+        $customer_code = 'perfex-' . $invoice->id . '-' . $row_id;
+        $body['customer_code'] = $customer_code;
+        $this->ci->db->where('id', $row_id)->update($table, [
+            'customer_code' => $customer_code,
+            'api_request'   => json_encode(pagou_redact($body)),
+        ]);
 
-        $random_string = substr(str_shuffle('abcdefghijklmnopqrstuvwxyz0123456789'), 0, 10);
-        $timestamp = time();
-        return $random_string . $timestamp . 'invoice' . $invoice_id;
-    }
-    
+        $response = $mode === 'due' ? $api->create_pix_due($body) : $api->create_pix($body);
 
-    private function parsePagouError($result, $raw_response) {
-        if (isset($result->message) && is_string($result->message)) { // Erro principal
-            $main_error = $result->message;
-            if (isset($result->errors) && is_array($result->errors) && count($result->errors) > 0) {
-                 $error_details = [];
-                 foreach($result->errors as $err_obj) {
-                     if(is_object($err_obj) && isset($err_obj->field) && isset($err_obj->message)){
-                        $error_details[] = "{$err_obj->field}: {$err_obj->message}";
-                     } elseif (is_string($err_obj)) {
-                        $error_details[] = $err_obj;
-                     }
-                 }
-                 if(!empty($error_details)){
-                    return $main_error . ' Detalhes: ' . implode('; ', $error_details);
-                 }
-            }
-            return $main_error;
-        } elseif (isset($result->error) && is_string($result->error)) {
-            return $result->error;
-        } elseif (isset($result->errors) && is_array($result->errors) && count($result->errors) > 0) { 
-             $error_details = [];
-             foreach($result->errors as $err_obj) {
-                 if(is_object($err_obj) && isset($err_obj->field) && isset($err_obj->message)){
-                    $error_details[] = "{$err_obj->field}: {$err_obj->message}";
-                 } elseif (is_string($err_obj)) {
-                    $error_details[] = $err_obj;
-                 }
-             }
-             return implode('; ', $error_details);
+        if ($response->http_code === 201 && !empty($response->body['id'])) {
+            $result = $response->body;
+            $this->ci->db->where('id', $row_id)->update($table, [
+                'transaction_id' => $result['id'],
+                'qr_code'        => $result['payload']['image'] ?? '',
+                'qr_code_text'   => $result['payload']['data'] ?? '',
+                'status'         => isset($result['status']) ? pagou_normalize_status($result['status']) : 'active',
+                'api_response'   => json_encode(pagou_redact($result)),
+            ]);
+            return $this->ci->db->where('id', $row_id)->get($table)->row();
         }
-        return substr(strip_tags($raw_response), 0, 250);
+
+        if ($response->uncertain()) {
+            $this->ci->db->where('id', $row_id)->update($table, ['status' => 'uncertain']);
+            $error = 'A Pagou não confirmou a criação do Pix. Aguarde alguns instantes e abra a fatura de novo; não pague um código diferente sem conferir.';
+            return null;
+        }
+
+        $this->ci->db->where('id', $row_id)->update($table, ['status' => 'failed', 'api_response' => json_encode($response->body)]);
+        $error = 'Não foi possível gerar o Pix: ' . $response->error_message();
+
+        return null;
     }
 
+    /**
+     * Multa, juros e desconto do Pix com vencimento, no formato {type, amount}.
+     */
+    private function charges($due_date)
+    {
+        $out = [];
+        $number = function ($v) {
+            return round((float) str_replace(',', '.', (string) $v), 2);
+        };
 
-    private function get_client_name($invoice) {
+        if ($this->getSetting('enable_fine') === '1' && $number($this->getSetting('fine_value')) > 0) {
+            $out['fine'] = [
+                'type'   => $this->getSetting('fine_type') === 'fixed' ? 'fixed' : 'percentage',
+                'amount' => $number($this->getSetting('fine_value')),
+            ];
+        }
+        if ($this->getSetting('enable_interest') === '1' && $number($this->getSetting('interest_value')) > 0) {
+            $type = $this->getSetting('interest_type');
+            $out['interest'] = [
+                'type'   => array_key_exists($type, self::INTEREST_TYPES) ? $type : 'percentage_month_calendar_days',
+                'amount' => $number($this->getSetting('interest_value')),
+            ];
+        }
+        if ($this->getSetting('enable_discount') === '1' && $number($this->getSetting('discount_value')) > 0) {
+            $limit = date('Y-m-d', strtotime($due_date . ' -' . max(0, (int) $this->getSetting('discount_days_before')) . ' days'));
+            if ($limit >= max(date('Y-m-d'), gmdate('Y-m-d'))) {
+                $out['discount'] = [
+                    'type'       => $this->getSetting('discount_type') === 'percentage' ? 'percentage' : 'fixed',
+                    'amount'     => $number($this->getSetting('discount_value')),
+                    'limit_date' => $limit,
+                ];
+            }
+        }
+
+        return $out;
+    }
+
+    private function fail($back, $message)
+    {
+        pagou_log('pix', 'error', $message);
+        set_alert('danger', $message);
+        redirect($back);
+        return false;
+    }
+
+    // ================================================================ dados do cliente
+
+    private function client($invoice)
+    {
         if (isset($invoice->client) && is_object($invoice->client)) {
-            if (!empty($invoice->client->company)) {
-                return $invoice->client->company;
-            } elseif (!empty($invoice->client->firstname) || !empty($invoice->client->lastname)) {
-                return trim($invoice->client->firstname . ' ' . $invoice->client->lastname);
-            }
+            return $invoice->client;
         }
-        
-        if (isset($invoice->clientid)) {
-            $this->ci->load->model('clients_model');
-            $client = $this->ci->clients_model->get($invoice->clientid);
-            if ($client) {
-                if (!empty($client->company)) {
-                    return $client->company;
-                } elseif (!empty($client->firstname) || !empty($client->lastname)) {
-                    return trim($client->firstname . ' ' . $client->lastname);
-                }
-            }
+        $this->ci->load->model('clients_model');
+        return $this->ci->clients_model->get($invoice->clientid);
+    }
+
+    private function client_name($invoice)
+    {
+        $client = $this->client($invoice);
+        if ($client && !empty($client->company)) {
+            return $client->company;
         }
-        
+        if ($client && (!empty($client->firstname) || !empty($client->lastname))) {
+            return trim(($client->firstname ?? '') . ' ' . ($client->lastname ?? ''));
+        }
         return 'Cliente';
     }
 
-
-    private function get_client_document($invoice) {
-        $document = '';
-        
-        if (isset($invoice->client) && is_object($invoice->client) && isset($invoice->client->vat)) {
-            $document = $invoice->client->vat;
-        } elseif (isset($invoice->clientid)) {
-            $this->ci->load->model('clients_model');
-            $client = $this->ci->clients_model->get($invoice->clientid);
-            if ($client && isset($client->vat)) {
-                $document = $client->vat;
-            }
-        }
-        
-        return preg_replace('/[^0-9]/', '', $document);
-    }
-
-
-    private function get_client_email($invoice) {
-        if (isset($invoice->client) && is_object($invoice->client)) {
-            if (isset($invoice->client->email)) {
-                return $invoice->client->email;
-            } elseif (isset($invoice->client->contact_email)) {
-                return $invoice->client->contact_email;
-            }
-        }
-        
-        if (isset($invoice->clientid)) {
-            $this->ci->load->model('clients_model');
-            $client = $this->ci->clients_model->get($invoice->clientid);
-            if ($client && isset($client->email)) {
-                return $client->email;
-            }
-        }
-        
-        return ''; 
-    }
-
-
-    public function check_transaction_status($transaction_id)
+    private function client_document($invoice)
     {
-        $this->log('info', "=== VERIFICANDO STATUS DA TRANSAÇÃO ===", $transaction_id);
-        
-        $is_production = $this->getSetting('is_production') === '1';
-        $api_base = pagou_api_base_url($is_production);
-        $api_endpoint = $api_base . '/v1/pix/' . $transaction_id;
-        
-        $this->log('debug', 'API endpoint de consulta', $api_endpoint);
-        
-        $ch = curl_init($api_endpoint);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'Content-Type: application/json',
-            'X-API-KEY: ' . $this->decryptSetting('api_token'),
-            'User-Agent: PerfexCRM/PagouPix/' . APP_VERSION
-        ]);
-        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 20);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 40);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
-        
-        $response_body = curl_exec($ch);
-        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $content_type = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
-        $total_time = curl_getinfo($ch, CURLINFO_TOTAL_TIME);
-        $curl_error = curl_error($ch);
-        curl_close($ch);
-        
-        $this->log('debug', 'Tempo total da consulta', $total_time . ' segundos');
-        $this->log('debug', 'Código HTTP recebido', $http_code);
-        $this->log('debug', 'Resposta da consulta', $response_body);
-        
-        if ($curl_error) {
-            $this->log('error', 'Erro cURL ao consultar status', $curl_error);
-        }
-        
-        $this->log('info', "=== FIM DA VERIFICAÇÃO DE STATUS ===");
-        
-        return json_decode($response_body);
-    }
-
-
-    public function log_to_db($invoice_id, $transaction_id, $log_type, $log_data)
-    {
-        if (!$this->enable_logs) {
-            return;
-        }
-        
-        if (is_array($log_data) || is_object($log_data)) {
-            $log_data = json_encode($log_data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
-        }
-        
-        $log_entry = [
-            'date' => date('Y-m-d H:i:s'),
-            'invoice_id' => $invoice_id,
-            'transaction_id' => $transaction_id,
-            'type' => $log_type,
-            'data' => $log_data
-        ];
-        
-        $this->ci->db->where('invoice_id', $invoice_id);
-        $this->ci->db->where('transaction_id', $transaction_id);
-        $transaction = $this->ci->db->get(db_prefix() . 'pagou_transactions_pix')->row();
-        
-        if ($transaction) {
-            $current_log = $transaction->webhook_log ? json_decode($transaction->webhook_log, true) : [];
-            if (!is_array($current_log)) {
-                $current_log = [];
-            }
-            $current_log[] = $log_entry;
-            
-            $this->ci->db->where('id', $transaction->id);
-            $this->ci->db->update(db_prefix() . 'pagou_transactions_pix', [
-                'webhook_log' => json_encode($current_log)
-            ]);
-        }
-        
-        $this->log('debug', 'Log registrado no banco de dados', $log_entry);
-    }
-
-
-    private function ensure_table_exists() {
-        $table_name = db_prefix() . 'pagou_transactions_pix';
-        
-        $table_exists = $this->ci->db->table_exists($table_name);
-        
-        if (!$table_exists) {
-            $this->log('info', 'Tabela de transações não encontrada. Criando tabela...');
-            
-            $this->ci->db->query("
-                CREATE TABLE IF NOT EXISTS `{$table_name}` (
-                    `id` int(11) NOT NULL AUTO_INCREMENT,
-                    `invoice_id` int(11) NOT NULL,
-                    `cliente` varchar(255) DEFAULT NULL,
-                    `doc` varchar(30) DEFAULT NULL,
-                    `transaction_id` varchar(255) NOT NULL,
-                    `external_id` varchar(255) DEFAULT NULL,
-                    `payment_method` varchar(50) NOT NULL,
-                    `qr_code` text NOT NULL,
-                    `qr_code_text` text NOT NULL,
-                    `amount` decimal(15,2) NOT NULL,
-                    `amount_final` decimal(15,2) DEFAULT NULL,
-                    `status` varchar(50) NOT NULL DEFAULT 'pending',
-                    `date_created` datetime NOT NULL,
-                    `data_pagamento` datetime DEFAULT NULL,
-                    `data_estorno` datetime DEFAULT NULL,
-                    `expiration_seconds` int(11) DEFAULT 86400,
-                    `api_request` text DEFAULT NULL,
-                    `api_response` text DEFAULT NULL,
-                    `webhook_log` text DEFAULT NULL,
-                    PRIMARY KEY (`id`),
-                    KEY `invoice_id` (`invoice_id`),
-                    KEY `transaction_id` (`transaction_id`),
-                    KEY `external_id` (`external_id`)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
-            ");
-            
-            $this->log('info', 'Tabela de transações criada com sucesso.');
-        } else {
-            $query = $this->ci->db->query("SHOW COLUMNS FROM `{$table_name}`");
-            $existing_columns = [];
-            
-            foreach ($query->result() as $row) {
-                $existing_columns[] = $row->Field;
-            }
-            
-            $required_columns = [
-                'id' => "INT(11) NOT NULL AUTO_INCREMENT PRIMARY KEY",
-                'invoice_id' => "INT(11) NOT NULL",
-                'cliente' => "VARCHAR(255) DEFAULT NULL",
-                'doc' => "VARCHAR(30) DEFAULT NULL",
-                'transaction_id' => "VARCHAR(255) NOT NULL",
-                'external_id' => "VARCHAR(255) DEFAULT NULL",
-                'payment_method' => "VARCHAR(50) NOT NULL",
-                'qr_code' => "TEXT NOT NULL",
-                'qr_code_text' => "TEXT NOT NULL",
-                'amount' => "DECIMAL(15,2) NOT NULL",
-                'amount_final' => "DECIMAL(15,2) DEFAULT NULL",
-                'status' => "VARCHAR(50) NOT NULL DEFAULT 'pending'",
-                'date_created' => "DATETIME NOT NULL",
-                'data_pagamento' => "DATETIME DEFAULT NULL",
-                'data_estorno' => "DATETIME DEFAULT NULL",
-                'expiration_seconds' => "INT(11) DEFAULT 86400",
-                'api_request' => "TEXT DEFAULT NULL",
-                'api_response' => "TEXT DEFAULT NULL",
-                'webhook_log' => "TEXT DEFAULT NULL"
-            ];
-            
-            foreach ($required_columns as $column => $definition) {
-                if (!in_array($column, $existing_columns)) {
-                    $this->log('info', "Coluna {$column} não encontrada. Adicionando coluna...");
-                    try {
-                        $this->ci->db->query("ALTER TABLE `{$table_name}` ADD COLUMN `{$column}` {$definition}");
-                        $this->log('info', "Coluna {$column} adicionada com sucesso.");
-                    } catch (\Throwable $e) {
-                        $this->log('error', "Erro ao adicionar coluna {$column}: " . $e->getMessage());
-                    }
-                }
-            }
-            
-            if (!$this->check_index_exists($table_name, 'invoice_id')) {
-                $this->log('info', "Índice para invoice_id não encontrado. Adicionando índice...");
-                try {
-                    $this->ci->db->query("ALTER TABLE `{$table_name}` ADD INDEX `invoice_id` (`invoice_id`)");
-                    $this->log('info', "Índice para invoice_id adicionado com sucesso.");
-                } catch (\Throwable $e) {
-                    $this->log('error', "Erro ao adicionar índice para invoice_id: " . $e->getMessage());
-                }
-            }
-            
-            if (!$this->check_index_exists($table_name, 'transaction_id')) {
-                $this->log('info', "Índice para transaction_id não encontrado. Adicionando índice...");
-                try {
-                    $this->ci->db->query("ALTER TABLE `{$table_name}` ADD INDEX `transaction_id` (`transaction_id`)");
-                    $this->log('info', "Índice para transaction_id adicionado com sucesso.");
-                } catch (\Throwable $e) {
-                    $this->log('error', "Erro ao adicionar índice para transaction_id: " . $e->getMessage());
-                }
-            }
-            
-            if (!$this->check_index_exists($table_name, 'external_id')) {
-                $this->log('info', "Índice para external_id não encontrado. Adicionando índice...");
-                try {
-                    $this->ci->db->query("ALTER TABLE `{$table_name}` ADD INDEX `external_id` (`external_id`)");
-                    $this->log('info', "Índice para external_id adicionado com sucesso.");
-                } catch (\Throwable $e) {
-                    $this->log('error', "Erro ao adicionar índice para external_id: " . $e->getMessage());
-                }
-            }
-        }
-    }
-
-
-    private function check_index_exists($table_name, $index_name) {
-        $query = $this->ci->db->query("SHOW INDEX FROM `{$table_name}` WHERE Key_name = '{$index_name}'");
-        return $query->num_rows() > 0;
+        $client = $this->client($invoice);
+        return preg_replace('/\D/', '', (string) ($client->vat ?? ''));
     }
 }

@@ -50,6 +50,7 @@ register_payment_gateway('pagou_boleto_gateway', 'pagou');
 register_payment_gateway('pagou_pix_gateway', 'pagou');
 
 hooks()->add_action('invoice_marked_as_cancelled', 'cancel_pagou_boleto');
+hooks()->add_action('invoice_marked_as_cancelled', 'pagou_cancel_invoice_pix');
 hooks()->add_action('after_invoice_added', 'pagou_auto_issue_boleto');
 hooks()->add_action('after_invoice_updated', 'pagou_auto_issue_boleto_on_update');
 hooks()->add_action('after_cron_run', 'process_pagou_boleto_invoices');
@@ -310,5 +311,40 @@ function pagou_reconcile_payments()
         $events->reconcile();
     } catch (\Throwable $e) {
         log_activity('Pagou: erro na reconciliação de pagamentos: ' . $e->getMessage());
+    }
+}
+
+
+/**
+ * Fatura cancelada: cancela o Pix próprio ainda em aberto (DELETE /v1/pix/{id}).
+ * 204 só indica que o pedido foi aceito; se o Pix já tiver sido pago, a baixa segue pelo webhook.
+ */
+function pagou_cancel_invoice_pix($invoice_id)
+{
+    try {
+        pagou_load_libraries();
+        if (!Pagou_schema::ready()) {
+            return;
+        }
+        $api = Pagou_api::for_gateway('pagou_pix');
+        if (!$api) {
+            return;
+        }
+        $CI = &get_instance();
+        $table = db_prefix() . 'pagou_transactions_pix';
+        $rows = $CI->db->where('invoice_id', $invoice_id)
+            ->where('boleto_transaction_id IS NULL', null, false)
+            ->where_in('status', ['pending', 'active', '1', '2'])
+            ->get($table)->result();
+        foreach ($rows as $row) {
+            $response = $api->cancel_pix($row->transaction_id);
+            if ($response->http_code === 204) {
+                $CI->db->where('id', $row->id)->update($table, ['status' => 'cancelled']);
+            } else {
+                log_activity('Pagou: não foi possível cancelar o Pix ' . $row->transaction_id . ' da fatura ID ' . $invoice_id . ' (HTTP ' . $response->http_code . ').');
+            }
+        }
+    } catch (\Throwable $e) {
+        log_activity('Pagou: erro ao cancelar o Pix da fatura: ' . $e->getMessage());
     }
 }
