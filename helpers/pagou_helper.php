@@ -182,11 +182,11 @@ function pagou_current_api_tokens()
 }
 
 /**
- * Chaves já usadas pelos gateways, guardadas criptografadas na opção pagou_known_api_tokens.
+ * Histórico criptografado de chaves: [{"k": chave, "retired_at": timestamp|null}].
  *
- * @return string[]
+ * @return array
  */
-function pagou_known_api_tokens()
+function pagou_api_token_history()
 {
     $stored = get_option('pagou_known_api_tokens');
     if (empty($stored)) {
@@ -195,30 +195,98 @@ function pagou_known_api_tokens()
     $CI = &get_instance();
     $CI->load->library('encryption');
     $decoded = json_decode((string) $CI->encryption->decrypt($stored), true);
+    if (!is_array($decoded)) {
+        return [];
+    }
+    $history = [];
+    foreach ($decoded as $item) {
+        if (is_string($item)) {
+            // Formato antigo (lista simples): trata como aposentada agora
+            $history[] = ['k' => $item, 'retired_at' => time()];
+        } elseif (is_array($item) && isset($item['k']) && is_string($item['k'])) {
+            $history[] = ['k' => $item['k'], 'retired_at' => isset($item['retired_at']) ? (int) $item['retired_at'] : null];
+        }
+    }
 
-    return is_array($decoded) ? array_values(array_filter($decoded, 'is_string')) : [];
+    return $history;
 }
 
 /**
- * Acrescenta as chaves atuais ao histórico (no máximo 10), para que a troca de chave
- * não invalide os webhooks das cobranças emitidas antes dela.
+ * Chaves anteriores ainda aceitas para webhooks: até 30 dias depois de substituídas.
+ * Todo efeito de um webhook é confirmado pela API com a chave atual.
+ *
+ * @return string[]
+ */
+function pagou_known_api_tokens()
+{
+    $valid = [];
+    foreach (pagou_api_token_history() as $item) {
+        if ($item['retired_at'] === null || $item['retired_at'] > time() - 30 * 86400) {
+            $valid[] = $item['k'];
+        }
+    }
+
+    return $valid;
+}
+
+/**
+ * Atualiza o histórico: chaves atuais sem data de aposentadoria, as substituídas com a data
+ * da troca; descarta as aposentadas há mais de 30 dias.
  *
  * @return void
  */
 function pagou_remember_api_tokens()
 {
-    $known = pagou_known_api_tokens();
     $current = pagou_current_api_tokens();
-    $missing = array_diff($current, $known);
-    if (empty($missing)) {
-        return;
-    }
+    $history = pagou_api_token_history();
+    $changed = false;
+    $known = [];
 
-    $merged = array_slice(array_values(array_unique(array_merge($current, $known))), 0, 10);
+    foreach ($history as $i => $item) {
+        $known[] = $item['k'];
+        if (in_array($item['k'], $current, true)) {
+            if ($item['retired_at'] !== null) {
+                $history[$i]['retired_at'] = null;
+                $changed = true;
+            }
+        } elseif ($item['retired_at'] === null) {
+            $history[$i]['retired_at'] = time();
+            $changed = true;
+        }
+    }
+    foreach ($current as $token) {
+        if (!in_array($token, $known, true)) {
+            $history[] = ['k' => $token, 'retired_at' => null];
+            $changed = true;
+        }
+    }
+    $before = count($history);
+    $history = array_values(array_filter($history, function ($item) {
+        return $item['retired_at'] === null || $item['retired_at'] > time() - 30 * 86400;
+    }));
+    $changed = $changed || count($history) !== $before;
+
+    if ($changed) {
+        pagou_save_api_token_history($history);
+    }
+}
+
+/**
+ * Esquece as chaves anteriores (por exemplo, depois de um vazamento).
+ *
+ * @return void
+ */
+function pagou_forget_previous_api_tokens()
+{
+    $current = pagou_current_api_tokens();
+    pagou_save_api_token_history(array_map(function ($k) { return ['k' => $k, 'retired_at' => null]; }, $current));
+}
+
+function pagou_save_api_token_history(array $history)
+{
     $CI = &get_instance();
     $CI->load->library('encryption');
-    $value = $CI->encryption->encrypt(json_encode($merged));
-
+    $value = $CI->encryption->encrypt(json_encode($history));
     $exists = $CI->db->where('name', 'pagou_known_api_tokens')->count_all_results(db_prefix() . 'options') > 0;
     if ($exists) {
         update_option('pagou_known_api_tokens', $value);
@@ -461,7 +529,7 @@ function pagou_redact($data)
     $sensitive = [
         'document', 'doc', 'cpf', 'cnpj', 'account', 'agency', 'bank', 'x-api-key', 'api_key',
         'api_token', 'card_token', 'cvv', 'number', 'email', 'phone', 'zip', 'street',
-        'qr_code', 'qr_code_img', 'image', 'data_url',
+        'qr_code', 'qr_code_img', 'image', 'data_url', 'payer', 'cliente', 'nome', 'description', 'descricao',
     ];
     if (is_object($data)) {
         $data = json_decode(json_encode($data), true);

@@ -110,4 +110,18 @@ class Pagou_conf extends AdminController
         // Caso não seja POST, apenas redireciona
         redirect(admin_url('pagou/pagou_conf'));
     }
+
+    /**
+     * Descarta as chaves de API anteriores guardadas para validar webhooks.
+     * Acesso via POST: /admin/pagou/pagou_conf/forget_keys
+     */
+    public function forget_keys()
+    {
+        if ($this->input->post()) {
+            pagou_forget_previous_api_tokens();
+            log_activity('Pagou: chaves de API anteriores descartadas por ' . get_staff_full_name(get_staff_user_id()));
+            set_alert('success', 'Chaves de API anteriores descartadas.');
+        }
+        redirect(admin_url('pagou/pagou_conf'));
+    }
 }

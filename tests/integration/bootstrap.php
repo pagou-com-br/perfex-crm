@@ -46,6 +46,7 @@ class FakeInvoices {
 class FakePayments {
     // Simplificação do Payments_model::add do Perfex: insere e recalcula o status
     public function add($data) {
+        if (!empty($GLOBALS['__fail_add'])) { return false; }
         $ci = get_instance();
         $data['daterecorded'] = date('Y-m-d H:i:s');
         $data['date'] = isset($data['date']) ? $data['date'] : date('Y-m-d');
@@ -70,7 +71,13 @@ function &get_instance() { global $CI; return $CI; }
 
 function db_prefix() { return 'tbl'; }
 function get_option($n) { $r = get_instance()->db->where('name', $n)->get('tbloptions')->row(); return $r ? $r->value : ''; }
-function update_option($n, $v) { get_instance()->db->where('name', $n)->update('tbloptions', ['value' => $v]); return true; }
+function update_option($n, $v) {
+    // Como no Perfex: cria a opção quando ela não existe
+    $db = get_instance()->db;
+    if ($db->where('name', $n)->count_all_results('tbloptions') > 0) { $db->where('name', $n)->update('tbloptions', ['value' => $v]); }
+    else { $db->insert('tbloptions', ['name' => $n, 'value' => $v, 'autoload' => 1]); }
+    return true;
+}
 function add_option($n, $v, $a = 1) { get_instance()->db->insert('tbloptions', ['name' => $n, 'value' => $v, 'autoload' => $a]); return true; }
 function log_activity($d) { $GLOBALS['__activity'][] = [0, $d]; }
 function _d($d) { return $d; }

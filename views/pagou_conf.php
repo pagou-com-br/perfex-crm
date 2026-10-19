@@ -45,6 +45,13 @@
               <button type="submit" class="btn btn-primary">Salvar</button>
             <?php echo form_close(); ?>
 
+            <hr />
+            <h4>Chaves de API anteriores</h4>
+            <p class="text-muted">Depois de trocar a chave de API, o módulo ainda aceita por 30 dias webhooks assinados com a chave anterior, para não perder confirmações de cobranças já emitidas. Se a chave anterior vazou, esqueça-a agora.</p>
+            <?php echo form_open(admin_url('pagou/pagou_conf/forget_keys')); ?>
+              <button type="submit" class="btn btn-danger" onclick="return confirm('Esquecer as chaves de API anteriores?');">Esquecer chaves anteriores</button>
+            <?php echo form_close(); ?>
+
           </div>
         </div><!-- end panel_s -->
 
