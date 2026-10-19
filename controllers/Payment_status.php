@@ -35,7 +35,15 @@ class Payment_status extends App_Controller
             }
         }
 
-        echo json_encode(['status' => (int) $invoice->status === 2 ? 'paid' : 'pending']);
+        $boleto_ready = $this->db->where('invoice_id', $invoice->id)
+            ->where('barcode_url !=', '')
+            ->where_in('status', ['pending', 'active', '1', '2'])
+            ->count_all_results(db_prefix() . 'pagou_transactions_boleto') > 0;
+
+        echo json_encode([
+            'status'       => (int) $invoice->status === 2 ? 'paid' : 'pending',
+            'boleto_ready' => $boleto_ready,
+        ]);
     }
 
     private function confirm_open_charges($invoice)

@@ -172,8 +172,9 @@
 
     <div class="payment-container">
         <?php
-        $has_pix = !empty($qr_code_text) && !empty($qr_code_img);
-        $has_barcode = !empty($barcode);
+        $e = function ($v) { return htmlspecialchars((string) $v, ENT_QUOTES, 'UTF-8'); };
+        $has_pix = !empty($qr_code_text);
+        $is_paid = ((int) $invoice->status === 2);
         ?>
 
         <div class="payment-tabs">
@@ -189,8 +190,8 @@
 
             <div class="pix-row">
                 <div class="pix-code" style="position: relative; width: 100%;">
-                    <input type="text" class="copy-input" value="<?php echo $qr_code_text; ?>" readonly style="width: 100%; padding-right: 80px;">
-                    <button class="copy-button" onclick="copyToClipboard('pix')" style="position: absolute; right: 0; top: 0; border-left: none;">
+                    <input type="text" id="pix-input" class="copy-input" value="<?php echo $e($qr_code_text); ?>" readonly style="width: 100%; padding-right: 80px;">
+                    <button class="copy-button" onclick="copyToClipboard('pix-input', this)" style="position: absolute; right: 0; top: 0; border-left: none;">
                         <i class="fa fa-copy"></i> Copiar
                     </button>
                 </div>
@@ -204,28 +205,11 @@
                     <p>3. Escaneie o QR Code ou cole o código PIX</p>
                     <p>4. Confirme as informações e realize o pagamento</p>
                 </div>
-
+                <?php if (!empty($qr_code_img)): ?>
                 <div class="qr-code">
-                    <img src="data:image/png;base64,<?php echo $qr_code_img; ?>" alt="QR Code PIX">
+                    <img src="data:image/png;base64,<?php echo $e($qr_code_img); ?>" alt="QR Code PIX">
                 </div>
-            </div>
-
-            <div class="payment-status">
-            <?php if ($invoice->status == 2): ?>
-                <p style="font-weight: bold; color: green;">
-                    <?php echo htmlspecialchars('PAGAMENTO REALIZADO COM SUCESSO!', ENT_QUOTES, 'UTF-8'); ?>
-                </p>
-            <?php else: ?>
-                <p><?php echo htmlspecialchars('Aguardando confirmação do pagamento...', ENT_QUOTES, 'UTF-8'); ?></p>
-                <div class="spinner-border text-primary" role="status" style="vertical-align: middle;">
-                    <span class="sr-only"><?php echo htmlspecialchars('Carregando...', ENT_QUOTES, 'UTF-8'); ?></span>
-                </div>
-                <div class="buttons-section">
-                    <button class="copy-button" onclick="window.location.reload();">
-                        <i class="fa fa-refresh"></i> Já realizei o pagamento
-                    </button>
-                </div>
-            <?php endif; ?>
+                <?php endif; ?>
             </div>
         </div>
         <?php endif; ?>
@@ -233,27 +217,25 @@
         <div id="boleto-content" class="payment-content <?php echo !$has_pix ? 'active' : ''; ?>">
             <div class="payment-title">Pagamento por Boleto</div>
 
-            <div id="boleto-loading" class="loading-indicator" <?php echo $has_barcode ? 'style="display:none;"' : ''; ?>>
+            <?php if (!$is_registered): ?>
+            <div id="boleto-loading" class="loading-indicator">
                 <i class="fa fa-circle-o-notch fa-spin"></i>
-                <p>Carregando informações do boleto...</p>
+                <p>O banco está registrando o boleto. Esta página atualiza sozinha em instantes.</p>
             </div>
-            <div class="buttons-section">
-                    <button class="copy-button" onclick="window.location.reload();">
-                        <i class="fa fa-refresh"></i> Click para Atualizar!
-                    </button>
-                </div>
-
-            <div id="boleto-content-inner" <?php echo !$has_barcode ? 'style="display:none;"' : ''; ?>>
+            <?php else: ?>
+            <div id="boleto-content-inner">
+                <?php if (!empty($barcode_svg)): ?>
                 <div class="barcode-section">
                     <h4>Código de Barras</h4>
-                    <img id="barcode-image" src="<?php echo $has_barcode ? site_url('pagou/generate_barcode/' . urlencode($barcode)) : ''; ?>" alt="Código de Barras do Boleto">
+                    <div class="barcode-svg"><?php echo $barcode_svg; ?></div>
                 </div>
+                <?php endif; ?>
 
                 <div class="barcode-section">
                     <h4>Linha Digitável</h4>
                     <div class="pix-code" style="position: relative; width: 100%;">
-                        <input type="text" id="barcode-input" class="copy-input" value="<?php echo $has_barcode ? chunk_split($barcode, 5, ' ') : ''; ?>" readonly style="width: 100%; padding-right: 150px;">
-                        <button class="copy-button" onclick="copyToClipboard('boleto')" style="position: absolute; right: 0; top: 0; border-left: none;">
+                        <input type="text" id="line-input" class="copy-input" value="<?php echo $e($line); ?>" readonly style="width: 100%; padding-right: 150px;">
+                        <button class="copy-button" onclick="copyToClipboard('line-input', this)" style="position: absolute; right: 0; top: 0; border-left: none;">
                             <i class="fa fa-copy"></i> Copiar Linha Digitável
                         </button>
                     </div>
@@ -261,30 +243,32 @@
 
                 <div class="barcode-section">
                     <h4>Data de Vencimento</h4>
-                    <p id="due-date-display"><?php echo !empty($due_date) ? date('d/m/Y', strtotime($due_date)) : ''; ?></p>
+                    <p id="due-date-display"><?php echo !empty($due_date) ? $e(date('d/m/Y', strtotime($due_date))) : ''; ?></p>
                 </div>
-            </div>
 
-            <div class="payment-status">
-            <?php if ($invoice->status == 2): ?>
-                <p style="font-weight: bold; color: green;">
-                    <?php echo htmlspecialchars('PAGAMENTO REALIZADO COM SUCESSO!', ENT_QUOTES, 'UTF-8'); ?>
-                </p>
-            <?php else: ?>
-                <p><?php echo htmlspecialchars('Aguardando confirmação do pagamento...', ENT_QUOTES, 'UTF-8'); ?></p>
-                <div class="spinner-border text-primary" role="status" style="vertical-align: middle;">
-                    <span class="sr-only"><?php echo htmlspecialchars('Carregando...', ENT_QUOTES, 'UTF-8'); ?></span>
-                </div>
                 <div class="buttons-section">
-                    <a href="https://fatura.pagou.com.br/boleto/<?php echo $pagou_transaction_id; ?>" target="_blank" class="copy-button" style="background-color: #e38a17; color: #ffffff;">
+                    <a href="<?php echo $e($boleto_html_url); ?>" target="_blank" rel="noopener" class="copy-button" style="background-color: #e38a17; color: #ffffff;">
                         <i class="fa fa-external-link"></i> Visualizar Boleto
                     </a>
-                    <button class="copy-button" onclick="window.location.reload();">
-                        <i class="fa fa-refresh"></i> Já realizei o pagamento
-                    </button>
+                    <a href="<?php echo $e($boleto_pdf_url); ?>" target="_blank" rel="noopener" class="copy-button">
+                        <i class="fa fa-file-pdf-o"></i> Baixar PDF
+                    </a>
                 </div>
-            <?php endif; ?>
             </div>
+            <?php endif; ?>
+        </div>
+
+        <div class="payment-status">
+        <?php if ($is_paid): ?>
+            <p style="font-weight: bold; color: green;">PAGAMENTO REALIZADO COM SUCESSO!</p>
+        <?php else: ?>
+            <p>Aguardando confirmação do pagamento...</p>
+            <div class="buttons-section">
+                <button class="copy-button" onclick="window.location.reload();">
+                    <i class="fa fa-refresh"></i> Já realizei o pagamento
+                </button>
+            </div>
+        <?php endif; ?>
         </div>
 
         <style>
@@ -292,155 +276,50 @@
             background-color: #cc7a14;
             color: #ffffff;
         }
+        .barcode-svg svg { max-width: 100%; height: 60px; }
         </style>
     </div>
 
     <script>
-    function copyToClipboard(type) {
-        const input = document.querySelector(type === 'pix' ? 
-            '#pix-content .copy-input' : '#boleto-content .copy-input');
+    function copyToClipboard(inputId, button) {
+        var input = document.getElementById(inputId);
         input.select();
         document.execCommand('copy');
+        var original = button.innerHTML;
+        button.textContent = 'Copiado!';
+        setTimeout(function () { button.innerHTML = original; }, 2000);
+    }
 
-        const button = event.target.closest('.copy-button');
-        const originalText = button.innerHTML;
-        button.innerHTML = '<i class="fa fa-check"></i> Copiado!';
-        setTimeout(() => {
-            button.innerHTML = originalText;
-        }, 2000);
-    }
-    
-    function showPaymentTab(tabName) {
-        const contents = document.querySelectorAll('.payment-content');
-        contents.forEach(content => {
-            content.classList.remove('active');
-        });
-        
-        const tabs = document.querySelectorAll('.payment-tab');
-        tabs.forEach(tab => {
-            tab.classList.remove('active');
-        });
-        
-        document.getElementById(tabName + '-content').classList.add('active');
-        event.target.classList.add('active');
-        
-        // Se o tab de boleto foi selecionado e os dados ainda não estão carregados, carregue-os
-        if (tabName === 'boleto' && document.getElementById('barcode-input').value.trim() === '') {
-            loadBoletoData();
-        }
-    }
-    
-    // Função para carregar os dados do boleto
-    function loadBoletoData() {
-        const invoiceId = <?php echo $invoice->id; ?>;
-        const transactionId = '<?php echo $pagou_transaction_id; ?>';
-        
-        if (!invoiceId || !transactionId) {
-            console.error('ID da fatura ou ID da transação não disponíveis');
-            return;
-        }
-        
-        // Mostrar indicador de carregamento
-        document.getElementById('boleto-loading').style.display = 'block';
-        document.getElementById('boleto-content-inner').style.display = 'none';
-        
-        fetch(`<?php echo site_url('pagou/get_boleto_data/'); ?>${invoiceId}/${transactionId}`, {
-            method: 'GET',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Requested-With': 'XMLHttpRequest'
-            },
-            cache: 'no-store'
-        })
-        .then(response => response.json())
-        .then(data => {
-            if (data && data.barcode) {
-                // Atualizar os elementos com os dados do boleto
-                const formattedBarcode = data.barcode.replace(/(.{5})/g, "$1 ").trim();
-                document.getElementById('barcode-input').value = formattedBarcode;
-                document.getElementById('barcode-image').src = `<?php echo site_url('pagou/generate_barcode/'); ?>${encodeURIComponent(data.barcode)}`;
-                
-                if (data.due_date) {
-                    const date = new Date(data.due_date);
-                    const formattedDate = new Intl.DateTimeFormat('pt-BR').format(date);
-                    document.getElementById('due-date-display').textContent = formattedDate;
-                }
-                
-                // Esconder indicador de carregamento e mostrar conteúdo
-                document.getElementById('boleto-loading').style.display = 'none';
-                document.getElementById('boleto-content-inner').style.display = 'block';
-            } else {
-                console.error('Dados do boleto não disponíveis:', data);
-                // Tentar novamente após 2 segundos
-                setTimeout(loadBoletoData, 2000);
-            }
-        })
-        .catch(error => {
-            console.error('Erro ao carregar dados do boleto:', error);
-            // Tentar novamente após 3 segundos
-            setTimeout(loadBoletoData, 3000);
-        });
-    }
-    
-    // Verificar se precisamos carregar os dados do boleto quando a página carrega
-    document.addEventListener('DOMContentLoaded', function() {
-        const boletoTab = document.querySelector('.payment-tab:not(.active)');
-        const isShownFirst = boletoTab ? boletoTab.classList.contains('active') : false;
-        
-        if (isShownFirst || !document.getElementById('barcode-input').value.trim()) {
-            loadBoletoData();
-        }
-    });
-    </script>
-    
-    <script>
-    const paymentCompleted = <?php echo ($invoice->status == 2) ? 'true' : 'false'; ?>;
-    let checkInterval;
-    
-    function checkPaymentStatus() {
-        if (paymentCompleted) {
-            console.log('Pagamento já confirmado, parando as verificações.');
-            if (checkInterval) {
-                clearInterval(checkInterval);
-            }
-            return;
-        }
-        
-        const invoiceId = <?php echo $invoice->id; ?>;
-        fetch(`<?php echo site_url('pagou/check_payment_status/'); ?>${invoiceId}`, {
-            method: 'GET',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Requested-With': 'XMLHttpRequest'
-            },
-            cache: 'no-store'
-        })
-        .then(response => response.json())
-        .then(data => {
-            if (data.status === 'paid') {
-                console.log('Pagamento confirmado!');
-                if (checkInterval) {
-                    clearInterval(checkInterval);
-                }
-                window.location.reload();
-            }
-        })
-        .catch(error => {
-            console.error('Erro ao verificar status:', error);
+    function showPaymentTab(tab) {
+        document.querySelectorAll('.payment-tab').forEach(function (el) { el.classList.remove('active'); });
+        document.querySelectorAll('.payment-content').forEach(function (el) { el.classList.remove('active'); });
+        var content = document.getElementById(tab + '-content');
+        if (content) { content.classList.add('active'); }
+        document.querySelectorAll('.payment-tab').forEach(function (el) {
+            if (el.getAttribute('onclick').indexOf("'" + tab + "'") !== -1) { el.classList.add('active'); }
         });
     }
 
-    if (!paymentCompleted) {
-        checkPaymentStatus();
-        checkInterval = setInterval(checkPaymentStatus, 5000);
-        
-        window.addEventListener('beforeunload', () => {
-            if (checkInterval) {
-                clearInterval(checkInterval);
-            }
-        });
-    } else {
-        console.log('Pagamento já confirmado, não há necessidade de verificações.');
-    }
+    (function () {
+        var paid = <?php echo $is_paid ? 'true' : 'false'; ?>;
+        var registered = <?php echo $is_registered ? 'true' : 'false'; ?>;
+        var statusUrl = <?php echo json_encode($status_url); ?>;
+        if (paid) { return; }
+        var attempts = 0;
+        var timer = setInterval(function () {
+            attempts++;
+            // Para depois de 30 minutos
+            if (attempts > 360) { clearInterval(timer); return; }
+            fetch(statusUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' }, cache: 'no-store' })
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    if (data.status === 'paid' || (!registered && data.boleto_ready)) {
+                        clearInterval(timer);
+                        window.location.reload();
+                    }
+                })
+                .catch(function () {});
+        }, 5000);
+    })();
     </script>
 </div>
