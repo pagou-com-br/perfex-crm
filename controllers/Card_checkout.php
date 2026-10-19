@@ -51,8 +51,8 @@ class Card_checkout extends App_Controller
             return $this->reply(422, 'error', 'Número de parcelas inválido.');
         }
 
-        // IP real do comprador (o CodeIgniter considera os proxies confiáveis de proxy_ips)
-        $ip = $this->input->ip_address();
+        // IP real do comprador: cabeçalhos de proxy só valem vindos de proxy confiável
+        $ip = pagou_client_ip((string) $gateway->getSetting('client_ip_mode'), (string) $gateway->getSetting('trusted_proxies'));
 
         $result = (new Pagou_card())->charge($invoice, $card, $installments, [
             'email' => (string) $this->input->post('email', true),

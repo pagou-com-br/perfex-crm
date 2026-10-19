@@ -12,7 +12,9 @@ defined('BASEPATH') or exit('No direct script access allowed');
 class Pagou_card
 {
     const GATEWAY = 'pagou_cartao';
-    const OPEN = ['creating', 'uncertain', 'pending', 'authorized', 'unknown'];
+    const OPEN = ['creating', 'uncertain', 'pending', 'authorized', 'unknown', 'needs_review'];
+    const MAX_FAILURES_PER_INVOICE = 5;
+    const MAX_FAILURES_PER_IP = 10;
     const FINAL_STATUSES = ['captured', 'settled', 'failed', 'canceled', 'reversed', 'charged_back', 'needs_review'];
 
     private $ci;
@@ -29,10 +31,24 @@ class Pagou_card
      */
     public function open_charge($invoice_id)
     {
-        return $this->ci->db->where('invoice_id', $invoice_id)
+        $table = db_prefix() . 'pagou_card_charges';
+        $open = $this->ci->db->where('invoice_id', $invoice_id)
             ->where_in('status', self::OPEN)
             ->order_by('id', 'DESC')
-            ->get(db_prefix() . 'pagou_card_charges')->row();
+            ->get($table)->row();
+        if ($open) {
+            return $open;
+        }
+
+        // Capturada na Pagou mas ainda sem baixa no Perfex: também bloqueia
+        return $this->ci->db->select('c.*')
+            ->from($table . ' c')
+            ->join(db_prefix() . 'pagou_settlements s', "s.charge_id = c.pagou_charge_id AND s.status IN ('done', 'skipped')", 'left', false)
+            ->where('c.invoice_id', $invoice_id)
+            ->where_in('c.status', ['captured', 'settled'])
+            ->where('s.id IS NULL', null, false)
+            ->order_by('c.id', 'DESC')->limit(1)
+            ->get()->row();
     }
 
     /**
@@ -49,20 +65,8 @@ class Pagou_card
         if (!$api) {
             return ['result' => 'error', 'message' => 'O pagamento com cartão está indisponível no momento.'];
         }
-        if (!pagou_invoice_is_open($invoice)) {
-            return ['result' => 'error', 'message' => 'Esta fatura não está aberta para pagamento.'];
-        }
-        $amount = pagou_invoice_amount_due($invoice);
-        if ($amount <= 0) {
-            return ['result' => 'error', 'message' => 'Esta fatura não tem valor em aberto.'];
-        }
         if (!filter_var($buyer_ip, FILTER_VALIDATE_IP)) {
             return ['result' => 'error', 'message' => 'Não foi possível identificar a conexão do pagador.'];
-        }
-
-        $customer = $this->customer($invoice, $contact, $missing);
-        if ($missing) {
-            return ['result' => 'error', 'message' => 'Para pagar com cartão, complete: ' . implode(', ', $missing) . '.'];
         }
 
         $table = db_prefix() . 'pagou_card_charges';
@@ -71,8 +75,31 @@ class Pagou_card
             return ['result' => 'processing', 'message' => 'Já existe um pagamento em andamento para esta fatura. Aguarde alguns instantes.'];
         }
         try {
+            // Dentro da trava: estado e valor da fatura relidos agora
+            $this->ci->load->model('invoices_model');
+            $invoice = $this->ci->invoices_model->get($invoice->id);
+            if (!pagou_invoice_is_open($invoice)) {
+                return ['result' => 'error', 'message' => 'Esta fatura não está aberta para pagamento.'];
+            }
+            $amount = pagou_invoice_amount_due($invoice);
+            if ($amount <= 0) {
+                return ['result' => 'error', 'message' => 'Esta fatura não tem valor em aberto.'];
+            }
             if ($this->open_charge($invoice->id)) {
                 return ['result' => 'processing', 'message' => 'Já existe um pagamento com cartão em processamento para esta fatura.'];
+            }
+
+            // Limite de recusas (teste de cartões): por fatura e por IP na última hora
+            $since = date('Y-m-d H:i:s', time() - 3600);
+            $by_invoice = $this->ci->db->where('invoice_id', $invoice->id)->where('status', 'failed')->where('created_at >=', $since)->count_all_results($table);
+            $by_ip = $this->ci->db->where('buyer_ip', $buyer_ip)->where('status', 'failed')->where('created_at >=', $since)->count_all_results($table);
+            if ($by_invoice >= self::MAX_FAILURES_PER_INVOICE || $by_ip >= self::MAX_FAILURES_PER_IP) {
+                return ['result' => 'error', 'message' => 'Muitas tentativas recusadas. Aguarde uma hora ou use outra forma de pagamento.'];
+            }
+
+            $customer = $this->customer($invoice, $contact, $missing);
+            if ($missing) {
+                return ['result' => 'error', 'message' => 'Para pagar com cartão, o cadastro precisa de: ' . implode(', ', $missing) . '. Fale com o estabelecimento para atualizar seus dados.'];
             }
 
             $description = hooks()->apply_filters('pagou_cartao_description', 'Fatura ' . format_invoice_number($invoice->id), $invoice);
@@ -105,8 +132,8 @@ class Pagou_card
             $key = 'perfex-card-' . bin2hex(random_bytes(16));
             $now = date('Y-m-d H:i:s');
 
-            // Grava chave e corpo exato antes do primeiro envio
-            $this->ci->db->insert($table, [
+            // Grava chave e corpo exato antes do primeiro envio; sem a linha, não envia
+            $inserted = $this->ci->db->insert($table, [
                 'invoice_id'      => $invoice->id,
                 'clientid'        => (int) $invoice->clientid,
                 'value_cents'     => $body['value'],
@@ -118,18 +145,22 @@ class Pagou_card
                 'created_at'      => $now,
                 'updated_at'      => $now,
             ]);
-            $row_id = $this->ci->db->insert_id();
+            $row_id = $inserted ? (int) $this->ci->db->insert_id() : 0;
+            if (!$row_id) {
+                return ['result' => 'error', 'message' => 'O pagamento com cartão está indisponível no momento.'];
+            }
 
             $response = $api->create_card_charge($raw, $key);
             $row = $this->apply_create_response($row_id, $response);
             if ($split && $row && $row->pagou_charge_id) {
                 (new Pagou_split())->snapshot('cartao', $row->pagou_charge_id, $invoice->id, $split, $response->body['split'] ?? null);
             }
+
+            // Baixa ainda dentro da trava: outra aba só segue depois dela
+            return $this->outcome($row);
         } finally {
             pagou_release_lock($lock);
         }
-
-        return $this->outcome($row, $response);
     }
 
     /**
@@ -162,7 +193,7 @@ class Pagou_card
             $update['failure_reason'] = mb_substr($response->error_message(), 0, 255);
         }
 
-        if (in_array($update['status'] ?? '', self::FINAL_STATUSES, true)) {
+        if (!empty($update['pagou_charge_id']) || in_array($update['status'] ?? '', self::FINAL_STATUSES, true)) {
             $update['request_enc'] = null; // o corpo com o token só é guardado enquanto pode ser repetido
         }
         $this->ci->db->where('id', $row_id)->update($table, $update);
@@ -176,7 +207,27 @@ class Pagou_card
      */
     public function recover($row)
     {
-        if (!empty($row->pagou_charge_id)) {
+        if (!empty($row->pagou_charge_id) || $row->status === 'needs_review') {
+            return $row;
+        }
+        // Criação ainda em curso (outra requisição): não repetir em paralelo
+        if ($row->status === 'creating' && strtotime($row->created_at) > time() - 60) {
+            return $row;
+        }
+        $lock = 'pagou_card_invoice_' . $row->invoice_id;
+        if (!pagou_acquire_lock($lock, 0)) {
+            return $row;
+        }
+        try {
+            return $this->recover_locked($this->ci->db->where('id', $row->id)->get(db_prefix() . 'pagou_card_charges')->row());
+        } finally {
+            pagou_release_lock($lock);
+        }
+    }
+
+    private function recover_locked($row)
+    {
+        if (!$row || !empty($row->pagou_charge_id) || $row->status === 'needs_review') {
             return $row;
         }
         $table = db_prefix() . 'pagou_card_charges';
@@ -203,14 +254,16 @@ class Pagou_card
     /**
      * Mensagem para o checkout a partir do estado da linha.
      */
-    public function outcome($row, $response = null)
+    public function outcome($row)
     {
         switch ($row ? $row->status : 'failed') {
             case 'captured':
             case 'settled':
-                pagou_load_libraries();
-                (new Pagou_events())->settle_card($row);
-                return ['result' => 'paid', 'message' => 'Pagamento aprovado.'];
+                list($result) = (new Pagou_events())->settle_card($row);
+                if ($result === Pagou_events::RESULT_PROCESSED) {
+                    return ['result' => 'paid', 'message' => 'Pagamento aprovado.'];
+                }
+                return ['result' => 'processing', 'message' => 'Pagamento aprovado; a confirmação na fatura está em processamento. Não tente de novo.'];
             case 'failed':
             case 'canceled':
                 $reason = $row && $row->failure_reason ? $row->failure_reason : 'Pagamento não aprovado.';
@@ -316,7 +369,7 @@ class Pagou_card
         return $value ? trim((string) $value->value) : '';
     }
 
-    private function status($value)
+    public static function status($value)
     {
         $value = strtolower((string) $value);
         $known = ['pending', 'authorized', 'captured', 'canceled', 'failed', 'reversed', 'charged_back', 'settled', 'unknown'];

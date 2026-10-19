@@ -142,6 +142,9 @@ class Pagou_schema
             self::set_option('pagou_split_min_margin_pct', '10');
         }
 
+        self::add_column($card, 'reverse_key', 'varchar(100) DEFAULT NULL');
+        self::add_column($card, 'reverse_state', 'varchar(20) DEFAULT NULL');
+
         self::add_column($pix, 'boleto_transaction_id', 'varchar(255) DEFAULT NULL');
         self::add_column($pix, 'refunded_amount', 'decimal(15,2) NOT NULL DEFAULT 0');
         self::add_column($pix, 'e2e_id', 'varchar(100) DEFAULT NULL');

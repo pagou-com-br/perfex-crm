@@ -533,6 +533,7 @@ function pagou_redact($data)
         'document', 'doc', 'cpf', 'cnpj', 'account', 'agency', 'bank', 'x-api-key', 'api_key',
         'api_token', 'card_token', 'cvv', 'number', 'email', 'phone', 'zip', 'street',
         'qr_code', 'qr_code_img', 'image', 'data_url', 'payer', 'cliente', 'nome', 'description', 'descricao',
+        'holder', 'name', 'zip_code', 'neighborhood', 'city', 'ip', 'buyer_ip', 'expires_at', 'customer',
     ];
     if (is_object($data)) {
         $data = json_decode(json_encode($data), true);
@@ -743,10 +744,10 @@ function pagou_client_display_name($client)
  * @param string $name
  * @return bool
  */
-function pagou_acquire_lock($name)
+function pagou_acquire_lock($name, $timeout = 10)
 {
     $CI = &get_instance();
-    $row = $CI->db->query('SELECT GET_LOCK(?, 10) AS l', [$name])->row();
+    $row = $CI->db->query('SELECT GET_LOCK(?, ?) AS l', [$name, (int) $timeout])->row();
 
     return $row && (int) $row->l === 1;
 }
@@ -755,4 +756,77 @@ function pagou_release_lock($name)
 {
     $CI = &get_instance();
     $CI->db->query('SELECT RELEASE_LOCK(?)', [$name]);
+}
+
+/**
+ * IP real do comprador para o antifraude.
+ *
+ * Modos (configuração do gateway de cartão):
+ * - remote: REMOTE_ADDR (servidor sem proxy na frente);
+ * - xff: percorre X-Forwarded-For da direita para a esquerda, pulando os proxies confiáveis;
+ * - cloudflare: CF-Connecting-IP, aceito só quando REMOTE_ADDR é um proxy confiável.
+ * Cabeçalhos só são considerados quando a conexão vem de um proxy confiável.
+ *
+ * @param string $mode
+ * @param string $trusted_csv IPs ou faixas CIDR dos proxies confiáveis, separados por vírgula
+ * @return string
+ */
+function pagou_client_ip($mode, $trusted_csv)
+{
+    $remote = (string) ($_SERVER['REMOTE_ADDR'] ?? '');
+    $trusted = array_filter(array_map('trim', explode(',', (string) $trusted_csv)));
+    $is_trusted = function ($ip) use ($trusted) {
+        foreach ($trusted as $range) {
+            if (pagou_ip_in_range($ip, $range)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    if ($mode === 'cloudflare' && $is_trusted($remote)) {
+        $cf = trim((string) ($_SERVER['HTTP_CF_CONNECTING_IP'] ?? ''));
+        return filter_var($cf, FILTER_VALIDATE_IP) ? $cf : $remote;
+    }
+    if ($mode === 'xff' && $is_trusted($remote)) {
+        $chain = array_reverse(array_filter(array_map('trim', explode(',', (string) ($_SERVER['HTTP_X_FORWARDED_FOR'] ?? '')))));
+        foreach ($chain as $ip) {
+            if (!filter_var($ip, FILTER_VALIDATE_IP)) {
+                break;
+            }
+            if (!$is_trusted($ip)) {
+                return $ip;
+            }
+        }
+    }
+
+    return $remote;
+}
+
+/**
+ * IP dentro de um IP exato ou faixa CIDR (IPv4 ou IPv6).
+ */
+function pagou_ip_in_range($ip, $range)
+{
+    if (strpos($range, '/') === false) {
+        return $ip === $range;
+    }
+    list($subnet, $bits) = explode('/', $range, 2);
+    $ip_bin = @inet_pton($ip);
+    $subnet_bin = @inet_pton($subnet);
+    if ($ip_bin === false || $subnet_bin === false || strlen($ip_bin) !== strlen($subnet_bin)) {
+        return false;
+    }
+    $bits = (int) $bits;
+    $bytes = intdiv($bits, 8);
+    if (substr($ip_bin, 0, $bytes) !== substr($subnet_bin, 0, $bytes)) {
+        return false;
+    }
+    $rest = $bits % 8;
+    if ($rest === 0) {
+        return true;
+    }
+    $mask = chr((0xff << (8 - $rest)) & 0xff);
+
+    return (ord($ip_bin[$bytes]) & ord($mask)) === (ord($subnet_bin[$bytes]) & ord($mask));
 }

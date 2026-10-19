@@ -24,6 +24,8 @@ class Pagou_cartao_gateway extends App_gateway
             ['name' => 'max_installments', 'label' => 'PARCELAS | Número máximo de parcelas oferecidas (1 = só à vista; até 12, limitado pela bandeira)', 'type' => 'input', 'default_value' => '1'],
             ['name' => 'min_installment_value', 'label' => 'PARCELAS | Valor mínimo de cada parcela em reais (0 = sem mínimo)', 'type' => 'input', 'default_value' => '0'],
             ['name' => 'currencies', 'label' => 'MOEDA | Códigos aceitos', 'type' => 'input', 'default_value' => 'BRL'],
+            ['name' => 'client_ip_mode', 'label' => 'ANTIFRAUDE | Origem do IP do comprador: "remote" (sem proxy), "xff" (X-Forwarded-For via proxy confiável) ou "cloudflare" (CF-Connecting-IP)', 'type' => 'input', 'default_value' => 'remote'],
+            ['name' => 'trusted_proxies', 'label' => 'ANTIFRAUDE | IPs/faixas CIDR dos proxies confiáveis, separados por vírgula (ex.: faixas da Cloudflare ou do seu nginx)', 'type' => 'input', 'default_value' => ''],
             ['name' => 'enable_split', 'label' => 'SPLIT | Aplicar as regras de split da Pagou (exige split habilitado na conta e recebedores autorizados no painel)', 'type' => 'yes_no', 'default_value' => 0],
         ]);
 

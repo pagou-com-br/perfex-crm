@@ -117,5 +117,47 @@ $GLOBALS['__activity'] = [];
 $found = false; foreach ($GLOBALS['__activity'] as $a) { if (strpos($a[1], 'Estorno da cobrança de cartão cc-5') !== false) { $found = true; } }
 t('estorno pelo painel vira atividade', $found && crows(45)[0]->status === 'reversed');
 
+echo "Revisão: baixa falhando depois da captura\n";
+$db->insert('tblinvoices', ['id' => 46, 'total' => 25, 'status' => 1, 'invoice_pagou' => 1, 'hash' => 'h46', 'duedate' => null, 'clientid' => 1]);
+api(['POST /v1/creditcard/charges' => ['code' => 201, 'body' => ['id' => 'cc-6', 'value' => 2500, 'status' => 'captured']], 'GET /v1/creditcard/charges/cc-6' => ['code' => 502]]);
+$r = charge(46);
+t('captured sem baixa: processing (não "paid")', $r['result'] === 'processing' && count(pays(46)) === 0);
+reset_calls();
+$r = charge(46);
+t('capturada sem baixa bloqueia nova compra', $r['result'] === 'processing' && last_call('POST /v1/creditcard/charges') === null);
+
+echo "Revisão: revisão bloqueia, token descartado, status normalizado\n";
+$r = charge(43);
+t('needs_review bloqueia nova compra', $r['result'] === 'processing' && count(crows(43)) === 1);
+$db->insert('tblinvoices', ['id' => 47, 'total' => 25, 'status' => 1, 'invoice_pagou' => 1, 'hash' => 'h47', 'duedate' => null, 'clientid' => 1]);
+api(['POST /v1/creditcard/charges' => ['code' => 201, 'body' => ['id' => 'cc-7', 'value' => 2500, 'status' => 'authorized']]]);
+charge(47);
+t('corpo com token apagado assim que há ID', crows(47)[0]->request_enc === null);
+api(['GET /v1/creditcard/charges/cc-7' => ['code' => 200, 'body' => ['id' => 'cc-7', 'value' => 2500, 'status' => 'in_analysis']]]);
+(new Pagou_events())->settle_card(crows(47)[0]);
+t('estado desconhecido vira unknown (segue acompanhado)', crows(47)[0]->status === 'unknown');
+
+echo "Revisão: limite de recusas\n";
+$db->insert('tblinvoices', ['id' => 48, 'total' => 25, 'status' => 1, 'invoice_pagou' => 1, 'hash' => 'h48', 'duedate' => null, 'clientid' => 1]);
+api(['POST /v1/creditcard/charges' => ['code' => 201, 'body' => ['id' => 'x', 'value' => 2500, 'status' => 'failed', 'failure_reason' => 'recusado']]]);
+for ($i = 0; $i < 5; $i++) {
+    file_put_contents(__DIR__ . '/state.json', json_encode(['POST /v1/creditcard/charges' => ['code' => 201, 'body' => ['id' => 'f-' . $i, 'value' => 2500, 'status' => 'failed', 'failure_reason' => 'recusado']]]));
+    charge(48, 1, '203.0.113.' . (10 + $i));
+}
+reset_calls();
+$r = charge(48, 1, '203.0.113.99');
+t('5 recusas na fatura em 1 hora bloqueiam novas tentativas', $r['result'] === 'error' && last_call('POST /v1/creditcard/charges') === null);
+
+echo "Revisão: IP do comprador\n";
+$_SERVER['REMOTE_ADDR'] = '10.0.0.5';
+$_SERVER['HTTP_X_FORWARDED_FOR'] = '1.2.3.4, 198.51.100.20, 10.0.0.9';
+$_SERVER['HTTP_CF_CONNECTING_IP'] = '198.51.100.30';
+t('remote: ignora cabeçalhos', pagou_client_ip('remote', '10.0.0.0/8') === '10.0.0.5');
+t('xff: primeiro IP não confiável da direita para a esquerda', pagou_client_ip('xff', '10.0.0.0/8') === '198.51.100.20');
+t('xff sem proxy confiável: REMOTE_ADDR', pagou_client_ip('xff', '192.168.0.0/16') === '10.0.0.5');
+t('cloudflare com proxy confiável', pagou_client_ip('cloudflare', '10.0.0.0/8') === '198.51.100.30');
+t('cloudflare vindo de fora: ignora o cabeçalho', pagou_client_ip('cloudflare', '172.16.0.0/12') === '10.0.0.5');
+t('IPv6 em faixa CIDR', pagou_ip_in_range('2400:cb00::1', '2400:cb00::/32') && !pagou_ip_in_range('2401:cb00::1', '2400:cb00::/32'));
+
 echo "\n$ok ok, $fail falhas\n";
 exit($fail ? 1 : 0);

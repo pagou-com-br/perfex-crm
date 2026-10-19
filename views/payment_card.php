@@ -68,7 +68,7 @@ $invoice_url = site_url('invoice/' . (int) $invoice->id . '/' . $invoice->hash);
     <?php endif; ?>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/node-forge@1.0.0/dist/forge.min.js" referrerpolicy="no-referrer"></script>
+<script src="https://cdn.jsdelivr.net/npm/node-forge@1.0.0/dist/forge.min.js" integrity="sha384-kCnNHsI8E0Dde+7EKTwuDBCdtanGM4kajy5i02M0FFyawUCS8bGADvvmwgrGOF9P" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
 <script src="https://js.cel.cash/checkout-v2.min.js" referrerpolicy="no-referrer"></script>
 <script>
 (function () {
@@ -93,13 +93,20 @@ $invoice_url = site_url('invoice/' . (int) $invoice->id . '/' . $invoice->hash);
         var attempts = 0;
         var timer = setInterval(function () {
             attempts++;
-            if (attempts > 120) { clearInterval(timer); return; }
+            if (attempts > 120) {
+                clearInterval(timer);
+                show('warning', 'Ainda não recebemos a confirmação do pagamento. Não pague de novo: confira a fatura mais tarde ou fale com o estabelecimento.');
+                return;
+            }
             fetch(config.statusUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' }, cache: 'no-store' })
                 .then(function (r) { return r.json(); })
                 .then(function (data) {
                     if (data.status === 'paid') {
                         clearInterval(timer);
                         window.location.href = config.invoiceUrl;
+                    } else if (data.card && data.card.status === 'needs_review') {
+                        clearInterval(timer);
+                        show('warning', 'Não foi possível confirmar o pagamento. Não tente de novo; o estabelecimento vai verificar.');
                     } else if (data.card && (data.card.status === 'failed' || data.card.status === 'canceled')) {
                         clearInterval(timer);
                         show('danger', 'Pagamento não aprovado' + (data.card.reason ? ': ' + data.card.reason : '.') + ' Recarregue a fatura para tentar com outro cartão.');
@@ -163,7 +170,9 @@ $invoice_url = site_url('invoice/' . (int) $invoice->id . '/' . $invoice->hash);
         } catch (err) {
             busy = false;
             submit.disabled = false;
-            show('danger', 'Confira os dados do cartão e tente novamente.');
+            show('danger', err && err.message === 'Biblioteca de pagamento indisponível.'
+                ? 'Não foi possível carregar o pagamento seguro. Verifique sua conexão e recarregue a página.'
+                : 'Confira os dados do cartão e tente novamente.');
             return;
         } finally {
             // Número e CVV não ficam no formulário depois de tokenizar
@@ -181,9 +190,24 @@ $invoice_url = site_url('invoice/' . (int) $invoice->id . '/' . $invoice->hash);
         body.append('phone', document.getElementById('payer-phone').value);
         card = null;
 
+        function allowRetry(text) {
+            busy = false;
+            submit.disabled = false;
+            show('danger', text);
+        }
+
         fetch(config.chargeUrl, { method: 'POST', body: body, headers: { 'X-Requested-With': 'XMLHttpRequest' }, credentials: 'same-origin' })
-            .then(function (r) { return r.json(); })
+            .then(function (r) {
+                var json = (r.headers.get('Content-Type') || '').indexOf('application/json') !== -1;
+                if (json) { return r.json(); }
+                // 4xx sem JSON (ex.: sessão/CSRF expirada): nada foi cobrado, pode tentar de novo
+                if (r.status >= 400 && r.status < 500) {
+                    return { result: 'retry', message: 'Sua sessão expirou. Recarregue a página e tente de novo.' };
+                }
+                throw new Error('uncertain');
+            })
             .then(function (data) {
+                if (data.result === 'retry') { allowRetry(data.message); return; }
                 if (data.csrf) { config.csrfHash = data.csrf; }
                 if (data.result === 'paid') {
                     show('success', data.message);
@@ -193,9 +217,7 @@ $invoice_url = site_url('invoice/' . (int) $invoice->id . '/' . $invoice->hash);
                     form.style.display = 'none';
                     poll();
                 } else {
-                    busy = false;
-                    submit.disabled = false;
-                    show('danger', data.message || 'Não foi possível processar o pagamento.');
+                    allowRetry(data.message || 'Não foi possível processar o pagamento.');
                 }
             })
             .catch(function () {

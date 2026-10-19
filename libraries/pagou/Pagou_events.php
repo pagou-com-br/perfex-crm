@@ -366,7 +366,7 @@ class Pagou_events
         if (isset($response->body['split'])) {
             (new Pagou_split())->track('cartao', $row->pagou_charge_id, $response->body['split']);
         }
-        $status = strtolower((string) ($response->body['status'] ?? 'unknown'));
+        $status = Pagou_card::status($response->body['status'] ?? 'unknown');
         $previous = $row->status;
         $update = ['status' => $status, 'updated_at' => date('Y-m-d H:i:s')];
         if (!empty($response->body['failure_reason'])) {
@@ -641,13 +641,25 @@ class Pagou_events
             }
         }
 
-        // Cartão: em andamento, indeterminadas e capturadas recentemente (estorno ou chargeback pelo painel)
-        $cards = $this->ci->db->where('created_at >=', date('Y-m-d H:i:s', strtotime('-30 days')))
-            ->where_in('status', array_merge(Pagou_card::OPEN, ['captured']))
+        // Cartão: em andamento (sem limite de idade) e, com menor frequência, capturadas/liquidadas
+        // dos últimos 180 dias (estorno ou chargeback pelo painel chegam depois)
+        $card_table = db_prefix() . 'pagou_card_charges';
+        $open_states = array_diff(Pagou_card::OPEN, ['needs_review']);
+        $cards = $this->ci->db->where_in('status', $open_states)
             ->order_by('last_checked_at IS NULL', 'DESC', false)
             ->order_by('last_checked_at', 'ASC')
-            ->limit(20)
-            ->get(db_prefix() . 'pagou_card_charges')->result();
+            ->limit(15)
+            ->get($card_table)->result();
+        $cards = array_merge($cards, $this->ci->db->where_in('status', ['captured', 'settled'])
+            ->where('created_at >=', date('Y-m-d H:i:s', strtotime('-180 days')))
+            ->group_start()
+                ->where('last_checked_at IS NULL', null, false)
+                ->or_where('last_checked_at <', date('Y-m-d H:i:s', time() - 6 * 3600))
+            ->group_end()
+            ->order_by('last_checked_at IS NULL', 'DESC', false)
+            ->order_by('last_checked_at', 'ASC')
+            ->limit(10)
+            ->get($card_table)->result());
         foreach ($cards as $row) {
             if (time() > $deadline) {
                 return;

@@ -32,7 +32,19 @@
                     <td><code><?php echo $e($c->pagou_charge_id ?: $c->idempotency_key); ?></code></td>
                     <td class="text-nowrap">
                       <?php if ($c->pagou_charge_id || in_array($c->status, ['uncertain', 'creating'], true)): ?>
-                        <a class="btn btn-default btn-xs" href="<?php echo $e(admin_url('pagou/card_admin/refresh/' . (int) $c->id)); ?>">Consultar</a>
+                        <?php echo form_open(admin_url('pagou/card_admin/refresh/' . (int) $c->id), ['style' => 'display:inline']); ?>
+                          <button type="submit" class="btn btn-default btn-xs">Consultar</button>
+                        <?php echo form_close(); ?>
+                      <?php endif; ?>
+                      <?php if ($can_reverse && $c->status === 'needs_review'): ?>
+                        <?php echo form_open(admin_url('pagou/card_admin/resolve/' . (int) $c->id), ['style' => 'display:inline-block']); ?>
+                          <select name="outcome" class="input-sm">
+                            <option value="not_charged">Conferido: não houve cobrança</option>
+                            <option value="charged">Houve cobrança (informe o ID)</option>
+                          </select>
+                          <input type="text" name="pagou_charge_id" class="input-sm" placeholder="ID da cobrança na Pagou" size="20">
+                          <button type="submit" class="btn btn-warning btn-xs">Resolver</button>
+                        <?php echo form_close(); ?>
                       <?php endif; ?>
                       <?php if ($can_reverse && in_array($c->status, ['authorized', 'captured', 'settled'], true)): ?>
                         <?php echo form_open(admin_url('pagou/card_admin/reverse/' . (int) $c->id), ['style' => 'display:inline', 'onsubmit' => "return confirm('Estornar integralmente esta cobrança de cartão?');"]); ?>
