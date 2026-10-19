@@ -161,6 +161,12 @@ class Pagou extends AdminController
      */
     public function reembolso_ajax()
     {
+        if ($this->input->method() !== 'delete') {
+            header('Content-Type: application/json');
+            echo json_encode(['status' => 'error', 'message' => 'Método não permitido.']);
+            return;
+        }
+
         if (!staff_can('access_reembolso', 'pagou_module')) {
             header('Content-Type: application/json');
             echo json_encode(['status' => 'error', 'message' => 'Sem permissão para esta ação.']);
@@ -391,44 +397,6 @@ class Pagou extends AdminController
         ];
     }
 
-    /**
-     * Exibe a página de configurações do Pagou
-     */
-    public function pagou_conf()
-    {
-        $this->writeLog('info', 'Acessando página de configurações do Pagou');
-        
-        // Verifica permissões
-        if (!is_admin()) {
-            access_denied('Pagou Configurações');
-        }
-        
-        // Processa o formulário de configuração se enviado
-        if ($this->input->post()) {
-            $post_data = $this->input->post();
-            
-            // Atualiza as configurações
-            update_option('pagou_logs_api', isset($post_data['pagou_logs_api']) ? 1 : 0);
-            
-            // Opções adicionais que podem ser configuradas
-            if (isset($post_data['pagou_webhook_url'])) {
-                update_option('pagou_webhook_url', $post_data['pagou_webhook_url']);
-            }
-            
-            set_alert('success', 'Configurações atualizadas com sucesso');
-            redirect(admin_url('pagou/pagou_conf'));
-        }
-        
-        // Carrega as configurações para exibição
-        $data = [
-            'title' => 'Configurações do Pagou',
-            'pagou_logs_api' => get_option('pagou_logs_api'),
-            'pagou_webhook_url' => get_option('pagou_webhook_url')
-        ];
-        
-        $this->load->view('admin/pagou/config', $data);
-    }
-    
     /**
      * Ajax handler para dados de transações PIX
      */

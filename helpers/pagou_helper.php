@@ -34,7 +34,8 @@ function cancel_pagou_boleto($invoice_id)
         foreach ($rows as $row) {
             $response = $api->cancel_charge($row->transaction_id);
             if ($response->http_code === 204) {
-                $CI->db->where('id', $row->id)->update($table, ['status' => 'cancelled']);
+                // Pedido aceito; a reconciliação acompanha até o estado final (inclusive o Pix vinculado)
+                $CI->db->where('id', $row->id)->update($table, ['status' => 'cancel_requested']);
             } else {
                 log_activity('Pagou: não foi possível cancelar o boleto ' . $row->transaction_id . ' da fatura ID ' . $invoice_id . ' (HTTP ' . $response->http_code . ' ' . $response->error_code() . ').');
             }
@@ -516,6 +517,7 @@ function pagou_load_libraries()
     require_once __DIR__ . '/../libraries/pagou/Pagou_api.php';
     require_once __DIR__ . '/../libraries/pagou/Pagou_events.php';
     require_once __DIR__ . '/../libraries/pagou/Pagou_schema.php';
+    require_once __DIR__ . '/../libraries/pagou/Pagou_card.php';
 }
 
 /**
@@ -658,4 +660,98 @@ function pagou_valid_document($document)
     }
 
     return false;
+}
+
+/**
+ * Procura, na listagem da API, a cobrança criada por uma requisição de resultado indeterminado.
+ * Janela fechada em torno da criação local, todas as páginas, casando por customer_code ou,
+ * na falta dele, por metadata invoice_id e valor.
+ *
+ * @param callable $list_fn   function(array $filters): Pagou_api_response
+ * @param object   $row       Linha local (date_created, customer_code, amount, invoice_id)
+ * @param string[] $known_ids IDs já vinculados a outras linhas locais
+ * @return array|null|false Item encontrado, null se a busca terminou sem encontrar, false se falhou
+ */
+function pagou_find_created_charge(callable $list_fn, $row, array $known_ids = [])
+{
+    $created = strtotime($row->date_created);
+    $filters = [
+        'created_at_from' => pagou_utc_filter_time($created - 300),
+        'created_at_to'   => pagou_utc_filter_time($created + 300),
+        'limit'           => 100,
+    ];
+
+    for ($page = 0; $page < 50; $page++) {
+        $response = $list_fn($filters + ['offset' => $page]);
+        if (!$response->ok()) {
+            return false;
+        }
+        $items = is_array($response->body) ? $response->body : [];
+        foreach ($items as $item) {
+            if (!is_array($item) || empty($item['id']) || in_array($item['id'], $known_ids, true)) {
+                continue;
+            }
+            if (!empty($row->customer_code) && ($item['customer_code'] ?? '') === $row->customer_code) {
+                return $item;
+            }
+            $invoice_meta = null;
+            foreach ((array) ($item['metadata'] ?? []) as $meta) {
+                if (is_array($meta) && ($meta['key'] ?? '') === 'invoice_id') {
+                    $invoice_meta = (string) ($meta['value'] ?? '');
+                }
+            }
+            if ($invoice_meta === (string) $row->invoice_id && isset($item['amount']) && abs((float) $item['amount'] - (float) $row->amount) < 0.005) {
+                return $item;
+            }
+        }
+        if (count($items) < $filters['limit']) {
+            return null;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Nome do cliente para cobrança: empresa ou, sem empresa, o contato principal.
+ *
+ * @param object|null $client
+ * @return string
+ */
+function pagou_client_display_name($client)
+{
+    if (!$client) {
+        return '';
+    }
+    if (!empty($client->company)) {
+        return trim((string) $client->company);
+    }
+    $CI = &get_instance();
+    $contact = $CI->db->select('firstname, lastname')
+        ->where('userid', $client->userid)
+        ->order_by('is_primary', 'DESC')
+        ->limit(1)
+        ->get(db_prefix() . 'contacts')->row();
+
+    return $contact ? trim($contact->firstname . ' ' . $contact->lastname) : '';
+}
+
+/**
+ * Trava nomeada por fatura (GET_LOCK). Retorna false se não foi obtida em 10 segundos.
+ *
+ * @param string $name
+ * @return bool
+ */
+function pagou_acquire_lock($name)
+{
+    $CI = &get_instance();
+    $row = $CI->db->query('SELECT GET_LOCK(?, 10) AS l', [$name])->row();
+
+    return $row && (int) $row->l === 1;
+}
+
+function pagou_release_lock($name)
+{
+    $CI = &get_instance();
+    $CI->db->query('SELECT RELEASE_LOCK(?)', [$name]);
 }

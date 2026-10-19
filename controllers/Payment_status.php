@@ -5,7 +5,7 @@ defined('BASEPATH') or exit('No direct script access allowed');
  * Status de pagamento consultado pela página pública da fatura (polling).
  * URL: pagou/payment_status/check/{invoice_id}/{hash}
  *
- * Exige o hash da fatura. Quando há Pix ou boleto em aberto, confirma na API
+ * Exige o hash da fatura. Quando há Pix, boleto ou cartão em aberto, confirma na API
  * (no máximo a cada 15 segundos por cobrança), para a baixa não depender só do webhook.
  */
 class Payment_status extends App_Controller
@@ -15,46 +15,64 @@ class Payment_status extends App_Controller
         header('Content-Type: application/json; charset=utf-8');
         header('Cache-Control: no-store');
 
-        $this->load->model('invoices_model');
-        $invoice = $this->invoices_model->get((int) $invoice_id);
+        // Validação leve antes de qualquer outra consulta
+        $invoice = $this->db->select('id, status, hash')
+            ->where('id', (int) $invoice_id)
+            ->get(db_prefix() . 'invoices')->row();
         if (!$invoice || !is_string($hash) || $hash === '' || !hash_equals((string) $invoice->hash, $hash)) {
             http_response_code(404);
             echo json_encode(['status' => 'not_found']);
             return;
         }
 
-        if ((int) $invoice->status !== 2) {
+        $status = (int) $invoice->status;
+        if (in_array($status, [1, 3, 4], true)) {
             try {
                 pagou_load_libraries();
                 if (Pagou_schema::ready()) {
-                    $this->confirm_open_charges($invoice);
-                    $invoice = $this->invoices_model->get($invoice->id);
+                    $this->confirm_open_charges((int) $invoice->id);
+                    $status = (int) $this->db->select('status')->where('id', $invoice->id)->get(db_prefix() . 'invoices')->row()->status;
                 }
             } catch (\Throwable $e) {
                 pagou_log('webhook', 'error', 'Falha na confirmação sob demanda: ' . $e->getMessage());
             }
         }
 
-        $boleto_ready = $this->db->where('invoice_id', $invoice->id)
+        $response = ['status' => $status === 2 ? 'paid' : 'pending'];
+
+        // Boleto registrado depois que a página abriu: dados para exibir sem recarregar
+        $boleto = $this->db->select('transaction_id, barcode_url')
+            ->where('invoice_id', $invoice->id)
             ->where('barcode_url !=', '')
             ->where_in('status', ['pending', 'active', '1', '2'])
-            ->count_all_results(db_prefix() . 'pagou_transactions_boleto') > 0;
+            ->order_by('id', 'DESC')->limit(1)
+            ->get(db_prefix() . 'pagou_transactions_boleto')->row();
+        $response['boleto_ready'] = (bool) $boleto;
+        if ($boleto) {
+            $response['boleto'] = [
+                'line'     => (string) $boleto->barcode_url,
+                'html_url' => 'https://fatura.pagou.com.br/boleto/' . rawurlencode($boleto->transaction_id),
+                'pdf_url'  => 'https://fatura.pagou.com.br/boleto/pdf/' . rawurlencode($boleto->transaction_id),
+            ];
+        }
 
-        echo json_encode([
-            'status'       => (int) $invoice->status === 2 ? 'paid' : 'pending',
-            'boleto_ready' => $boleto_ready,
-        ]);
+        echo json_encode($response);
     }
 
-    private function confirm_open_charges($invoice)
+    private function confirm_open_charges($invoice_id)
     {
         $events = new Pagou_events();
-        $open = ['pending', 'active', '1', '2'];
         $limit = date('Y-m-d H:i:s', time() - 15);
+        $jobs = [
+            'pagou_transactions_pix'    => ['settle_pix', ['pending', 'active', '1', '2']],
+            'pagou_transactions_boleto' => ['settle_boleto', ['pending', 'active', '1', '2']],
+            'pagou_card_charges'        => ['settle_card', Pagou_card::OPEN],
+        ];
 
-        foreach (['pagou_transactions_pix' => 'settle_pix', 'pagou_transactions_boleto' => 'settle_boleto'] as $table => $method) {
-            $this->db->where('invoice_id', $invoice->id)
-                ->where_in('status', $open)
+        foreach ($jobs as $table => $job) {
+            list($method, $statuses) = $job;
+            $this->db->where('invoice_id', $invoice_id)
+                ->where_in('status', $statuses)
                 ->group_start()
                 ->where('last_checked_at IS NULL', null, false)
                 ->or_where('last_checked_at <', $limit)

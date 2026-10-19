@@ -175,6 +175,7 @@
         $e = function ($v) { return htmlspecialchars((string) $v, ENT_QUOTES, 'UTF-8'); };
         $has_pix = !empty($qr_code_text);
         $is_paid = ((int) $invoice->status === 2);
+        $invoice_url = site_url('invoice/' . (int) $invoice->id . '/' . $invoice->hash);
         ?>
 
         <div class="payment-tabs">
@@ -220,7 +221,22 @@
             <?php if (!$is_registered): ?>
             <div id="boleto-loading" class="loading-indicator">
                 <i class="fa fa-circle-o-notch fa-spin"></i>
-                <p>O banco está registrando o boleto. Esta página atualiza sozinha em instantes.</p>
+                <p>O banco está registrando o boleto. Os dados aparecem aqui em instantes.</p>
+            </div>
+            <div id="boleto-late" style="display:none;">
+                <div class="barcode-section">
+                    <h4>Linha Digitável</h4>
+                    <div class="pix-code" style="position: relative; width: 100%;">
+                        <input type="text" id="line-input" class="copy-input" value="" readonly style="width: 100%; padding-right: 150px;">
+                        <button class="copy-button" onclick="copyToClipboard('line-input', this)" style="position: absolute; right: 0; top: 0; border-left: none;">
+                            <i class="fa fa-copy"></i> Copiar Linha Digitável
+                        </button>
+                    </div>
+                </div>
+                <div class="buttons-section">
+                    <a id="late-html" href="#" target="_blank" rel="noopener" class="copy-button" style="background-color: #e38a17; color: #ffffff;"><i class="fa fa-external-link"></i> Visualizar Boleto</a>
+                    <a id="late-pdf" href="#" target="_blank" rel="noopener" class="copy-button"><i class="fa fa-file-pdf-o"></i> Baixar PDF</a>
+                </div>
             </div>
             <?php else: ?>
             <div id="boleto-content-inner">
@@ -264,9 +280,9 @@
         <?php else: ?>
             <p>Aguardando confirmação do pagamento...</p>
             <div class="buttons-section">
-                <button class="copy-button" onclick="window.location.reload();">
+                <a class="copy-button" href="<?php echo $e($invoice_url); ?>">
                     <i class="fa fa-refresh"></i> Já realizei o pagamento
-                </button>
+                </a>
             </div>
         <?php endif; ?>
         </div>
@@ -304,6 +320,7 @@
         var paid = <?php echo $is_paid ? 'true' : 'false'; ?>;
         var registered = <?php echo $is_registered ? 'true' : 'false'; ?>;
         var statusUrl = <?php echo json_encode($status_url); ?>;
+        var invoiceUrl = <?php echo json_encode($invoice_url); ?>;
         if (paid) { return; }
         var attempts = 0;
         var timer = setInterval(function () {
@@ -313,9 +330,19 @@
             fetch(statusUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' }, cache: 'no-store' })
                 .then(function (r) { return r.json(); })
                 .then(function (data) {
-                    if (data.status === 'paid' || (!registered && data.boleto_ready)) {
+                    if (data.status === 'paid') {
                         clearInterval(timer);
-                        window.location.reload();
+                        // A página do boleto é resposta de um POST: volta para a fatura por GET
+                        window.location.href = invoiceUrl;
+                        return;
+                    }
+                    if (!registered && data.boleto_ready && data.boleto) {
+                        registered = true;
+                        document.getElementById('line-input').value = data.boleto.line;
+                        document.getElementById('late-html').href = data.boleto.html_url;
+                        document.getElementById('late-pdf').href = data.boleto.pdf_url;
+                        document.getElementById('boleto-loading').style.display = 'none';
+                        document.getElementById('boleto-late').style.display = 'block';
                     }
                 })
                 .catch(function () {});

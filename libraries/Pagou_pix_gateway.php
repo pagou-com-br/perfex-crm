@@ -118,7 +118,9 @@ class Pagou_pix_gateway extends App_gateway
 
         // Uma emissão por vez para a mesma fatura (cliques duplos, abas simultâneas)
         $lock = 'pagou_pix_invoice_' . $invoice->id;
-        $this->ci->db->query('SELECT GET_LOCK(?, 10) AS l', [$lock]);
+        if (!pagou_acquire_lock($lock)) {
+            return $this->fail($back, 'Já existe uma emissão de Pix em andamento para esta fatura. Tente novamente em instantes.');
+        }
         try {
             $row = $this->current_charge($api, $invoice, $amount);
             if ($row === false) {
@@ -131,7 +133,7 @@ class Pagou_pix_gateway extends App_gateway
                 }
             }
         } finally {
-            $this->ci->db->query('SELECT RELEASE_LOCK(?)', [$lock]);
+            pagou_release_lock($lock);
         }
 
         $this->ci->load->view('pagou/payment_pix', [
@@ -178,20 +180,28 @@ class Pagou_pix_gateway extends App_gateway
 
             // Vencido ou com valor diferente: cancela antes de emitir outro
             $cancel = $api->cancel_pix($row->transaction_id);
-            if ($cancel->http_code === 204 || $cancel->not_found()) {
-                $this->ci->db->where('id', $row->id)->update($table, ['status' => $expired ? 'expired' : 'cancelled']);
-                continue;
+            if ($cancel->uncertain()) {
+                return false;
             }
+            // Qualquer resposta: o estado vem da consulta (404 também pode ser "não elegível", ex.: pago)
             $check = $api->get_pix($row->transaction_id);
-            $status = $check->ok() ? (int) ($check->body['status'] ?? 0) : 0;
-            if ($status === 4) {
+            if (!$check->ok() || !is_array($check->body)) {
+                return false;
+            }
+            $status = (int) ($check->body['status'] ?? 0);
+            if ($status === 4 || $status === 5) {
                 // Pago enquanto isso: a baixa vem pelo processador de eventos
-                pagou_load_libraries();
                 (new Pagou_events())->settle_pix($row);
                 return false;
             }
-            if (in_array($status, [3, 6], true)) {
-                $this->ci->db->where('id', $row->id)->update($table, ['status' => pagou_normalize_status($status)]);
+            if ($cancel->http_code === 204 && in_array($status, [1, 2], true)) {
+                // Pedido de cancelamento aceito; a reconciliação acompanha até o estado final
+                $this->ci->db->where('id', $row->id)->update($table, ['status' => 'cancel_requested']);
+                continue;
+            }
+            if (in_array($status, [3, 6], true) || $expired) {
+                // Encerrado na Pagou, ou QR imediato já vencido e não pago
+                $this->ci->db->where('id', $row->id)->update($table, ['status' => in_array($status, [3, 6], true) ? pagou_normalize_status($status) : 'expired']);
                 continue;
             }
 
@@ -209,34 +219,29 @@ class Pagou_pix_gateway extends App_gateway
     private function recover_uncertain(Pagou_api $api, $row)
     {
         $table = db_prefix() . 'pagou_transactions_pix';
-        $from = strtotime($row->date_created) - 300;
-        $list = $api->list_pix([
-            'created_at_from' => pagou_utc_filter_time($from),
-            'created_at_to'   => pagou_utc_filter_time(time() + 60),
-            'limit'           => 100,
-            'offset'          => 0,
-        ]);
-        if (!$list->ok()) {
+        $known = array_column($this->ci->db->select('transaction_id')->where('invoice_id', $row->invoice_id)->get($table)->result_array(), 'transaction_id');
+        $item = pagou_find_created_charge(function ($filters) use ($api) {
+            return $api->list_pix($filters);
+        }, $row, $known);
+
+        if ($item === false) {
             return false;
         }
-
-        foreach ((array) $list->body as $item) {
-            if (is_array($item) && ($item['customer_code'] ?? '') === $row->customer_code && !empty($item['id'])) {
-                $full = $api->get_pix($item['id']);
-                $body = $full->ok() && is_array($full->body) ? $full->body : $item;
-                $this->ci->db->where('id', $row->id)->update($table, [
-                    'transaction_id' => $item['id'],
-                    'qr_code'        => $body['payload']['image'] ?? '',
-                    'qr_code_text'   => $body['payload']['data'] ?? '',
-                    'status'         => pagou_normalize_status($body['status'] ?? 1),
-                    'api_response'   => json_encode(pagou_redact($body)),
-                ]);
-                return $this->ci->db->where('id', $row->id)->get($table)->row();
-            }
+        if ($item) {
+            $full = $api->get_pix($item['id']);
+            $body = $full->ok() && is_array($full->body) ? $full->body : $item;
+            $this->ci->db->where('id', $row->id)->update($table, [
+                'transaction_id' => $item['id'],
+                'qr_code'        => $body['payload']['image'] ?? '',
+                'qr_code_text'   => $body['payload']['data'] ?? '',
+                'status'         => pagou_normalize_status($body['status'] ?? 1),
+                'api_response'   => json_encode(pagou_redact($body)),
+            ]);
+            return $this->ci->db->where('id', $row->id)->get($table)->row();
         }
 
-        // Só descarta depois de tempo suficiente para a cobrança aparecer na listagem
-        if (time() - strtotime($row->date_created) < 120) {
+        // Só é conclusivo depois que a janela de busca terminou
+        if (time() < strtotime($row->date_created) + 360) {
             return false;
         }
         $this->ci->db->where('id', $row->id)->update($table, ['status' => 'failed']);
@@ -323,7 +328,7 @@ class Pagou_pix_gateway extends App_gateway
             return $this->ci->db->where('id', $row_id)->get($table)->row();
         }
 
-        if ($response->uncertain()) {
+        if ($response->uncertain() || $response->http_code === 409) {
             $this->ci->db->where('id', $row_id)->update($table, ['status' => 'uncertain']);
             $error = 'A Pagou não confirmou a criação do Pix. Aguarde alguns instantes e abra a fatura de novo; não pague um código diferente sem conferir.';
             return null;
@@ -393,14 +398,8 @@ class Pagou_pix_gateway extends App_gateway
 
     private function client_name($invoice)
     {
-        $client = $this->client($invoice);
-        if ($client && !empty($client->company)) {
-            return $client->company;
-        }
-        if ($client && (!empty($client->firstname) || !empty($client->lastname))) {
-            return trim(($client->firstname ?? '') . ' ' . ($client->lastname ?? ''));
-        }
-        return 'Cliente';
+        $name = pagou_client_display_name($this->client($invoice));
+        return $name !== '' ? $name : 'Cliente';
     }
 
     private function client_document($invoice)

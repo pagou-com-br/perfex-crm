@@ -2,11 +2,11 @@
 defined('BASEPATH') or exit('No direct script access allowed');
 
 /**
- * Esquema da versão 2.0, idempotente: usado pela instalação e pela migration 200.
+ * Esquema da versão 2.x, idempotente: usado pela instalação e pelas migrations 200 e 210.
  */
 class Pagou_schema
 {
-    const VERSION = 200;
+    const VERSION = 210;
 
     /**
      * @param bool $is_upgrade true quando vem de uma versão anterior (migration)
@@ -61,6 +61,35 @@ class Pagou_schema
             ) ENGINE=InnoDB DEFAULT CHARSET=" . $db->char_set . ';');
         }
 
+        // 2.1: cobranças de cartão (uma linha por tentativa de compra, com a chave de idempotência)
+        $card = db_prefix() . 'pagou_card_charges';
+        if (!$db->table_exists($card)) {
+            $db->query("CREATE TABLE `{$card}` (
+                `id` int(11) NOT NULL AUTO_INCREMENT,
+                `invoice_id` int(11) NOT NULL,
+                `clientid` int(11) NOT NULL DEFAULT 0,
+                `pagou_charge_id` varchar(64) DEFAULT NULL,
+                `pagou_customer_id` varchar(64) DEFAULT NULL,
+                `pagou_card_id` varchar(64) DEFAULT NULL,
+                `value_cents` bigint(20) NOT NULL,
+                `installments` tinyint(4) NOT NULL DEFAULT 1,
+                `status` varchar(20) NOT NULL,
+                `failure_reason` varchar(255) DEFAULT NULL,
+                `idempotency_key` varchar(100) NOT NULL,
+                `request_enc` mediumtext,
+                `buyer_ip` varchar(45) DEFAULT NULL,
+                `brand` varchar(30) DEFAULT NULL,
+                `last4` varchar(4) DEFAULT NULL,
+                `created_at` datetime NOT NULL,
+                `updated_at` datetime NOT NULL,
+                `last_checked_at` datetime DEFAULT NULL,
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `idempotency_key` (`idempotency_key`),
+                UNIQUE KEY `pagou_charge_id` (`pagou_charge_id`),
+                KEY `invoice_status` (`invoice_id`, `status`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=" . $db->char_set . ';');
+        }
+
         self::add_column($pix, 'boleto_transaction_id', 'varchar(255) DEFAULT NULL');
         self::add_column($pix, 'refunded_amount', 'decimal(15,2) NOT NULL DEFAULT 0');
         self::add_column($pix, 'e2e_id', 'varchar(100) DEFAULT NULL');
@@ -73,6 +102,8 @@ class Pagou_schema
         self::add_column($pix, 'last_checked_at', 'datetime DEFAULT NULL');
         self::add_column($boleto, 'last_checked_at', 'datetime DEFAULT NULL');
         self::add_column(db_prefix() . 'pix_avulso', 'qr_code', 'text NULL');
+        self::add_column(db_prefix() . 'pix_avulso', 'cpf_attempts', 'int(11) NOT NULL DEFAULT 0');
+        self::add_column(db_prefix() . 'pix_avulso', 'cpf_locked_until', 'datetime DEFAULT NULL');
 
         // Pix vinculado das versões anteriores: liga a linha ao boleto pelo qrcode_id (em lotes)
         if ($db->table_exists($boleto) && $db->table_exists($pix)) {
@@ -96,15 +127,16 @@ class Pagou_schema
 
         self::backfill_settlements();
 
-        // Uma única vez, na primeira aplicação do esquema 2.0 (instalação ou atualização):
+        // Uma única vez, na primeira aplicação de qualquer esquema 2.x (instalação ou atualização):
         // em instalação nova as opções não existem e nada é convertido
-        if (!self::ready()) {
+        $first_apply = !get_option('pagou_schema_version');
+        if ($first_apply) {
             self::convert_legacy_settings();
         }
 
         // Faturas que já existiam não entram na emissão automática (evita emissão em massa)
         $invoices = db_prefix() . 'invoices';
-        if ($db->field_exists('invoice_pagou', $invoices) && !get_option('pagou_schema_version')) {
+        if ($db->field_exists('invoice_pagou', $invoices) && $first_apply) {
             $db->query("UPDATE `{$invoices}` SET `invoice_pagou` = 1 WHERE (`invoice_pagou` IS NULL OR `invoice_pagou` = 0) AND `status` <> 6");
         }
 
@@ -183,7 +215,7 @@ class Pagou_schema
     }
 
     /**
-     * O esquema 2.0 já foi aplicado (cron e webhooks só operam depois disso).
+     * O esquema atual já foi aplicado (cron, webhooks e gateways só operam depois disso).
      */
     public static function ready()
     {

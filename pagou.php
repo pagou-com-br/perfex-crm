@@ -147,89 +147,59 @@ function pagou_auto_issue_boleto($invoice_id)
 {
     $CI = &get_instance();
     $CI->load->model('invoices_model');
-    
     $invoice = $CI->invoices_model->get($invoice_id);
-    
-    if (!$invoice) {
-        log_activity('Pagou: Fatura ID ' . $invoice_id . ' não encontrada para emissão automática de boleto.');
-        return false;
-    }
-    
-
-    $allowed_payment_modes = [];
-    if (!empty($invoice->allowed_payment_modes)) {
-        $allowed_payment_modes = unserialize($invoice->allowed_payment_modes);
-    }
-    
-    if (!is_array($allowed_payment_modes)) {
-        log_activity('Pagou: Fatura ID ' . $invoice_id . ' - Modos de pagamento não definidos ou inválidos.');
-        return false;
-    }
-    
-    if (!in_array('pagou_boleto', $allowed_payment_modes)) {
+    if (!$invoice || !pagou_invoice_is_open($invoice)) {
         return false;
     }
 
-    if (!pagou_invoice_is_open($invoice)) {
+    $allowed = !empty($invoice->allowed_payment_modes) ? @unserialize($invoice->allowed_payment_modes) : [];
+    if (!is_array($allowed) || !in_array('pagou_boleto', $allowed, true)) {
         return false;
     }
-    
-    $CI->db->where('invoice_id', $invoice_id);
-    $existing_transaction = $CI->db->get(db_prefix() . 'pagou_transactions_boleto')->row();
-    
-    if ($existing_transaction) {
-        return pagou_update_boleto_info($existing_transaction);
-    }
-    
+
     try {
         require_once(__DIR__ . '/libraries/Pagou_boleto_gateway.php');
         $gateway = new Pagou_boleto_gateway();
-        
-        $data = ['invoice' => $invoice, 'auto_generated' => true];
-        
-        $result = $gateway->process_payment($data);
-        
-        // Marca a fatura para o cron não reemitir às cegas (1 = emitido ou indeterminado)
-        if ($result === 'uncertain' || $result) {
-            $CI->db->where('id', $invoice_id);
-            $CI->db->update(db_prefix() . 'invoices', ['invoice_pagou' => 1]);
-        }
-
-        if ($result === 'uncertain') {
-            log_activity('Pagou: emissão do boleto da fatura ID ' . $invoice_id . ' sem confirmação da API. Confira no painel da Pagou antes de emitir outro.');
-            return false;
-        }
-
-        if ($result) {
-            log_activity('Pagou: Boleto gerado automaticamente para a fatura ID ' . $invoice_id);
-            return true;
-        } else {
-            log_activity('Pagou: Falha ao gerar boleto automaticamente para a fatura ID ' . $invoice_id);
-            return false;
-        }
+        // O gateway reaproveita, atualiza ou substitui o boleto existente conforme a consulta à API
+        $result = $gateway->process_payment(['invoice' => $invoice, 'auto_generated' => true]);
+        return pagou_flag_boleto_result($invoice_id, $result, false);
     } catch (\Throwable $e) {
         log_activity('Pagou: Erro ao gerar boleto automaticamente: ' . $e->getMessage());
         return false;
     }
 }
 
+/**
+ * Grava em invoice_pagou o resultado da emissão automática:
+ * 1 = emitido ou indeterminado (não reemitir às cegas), 2 = recusado pela API (só no cron);
+ * 'later' (sem chave, banco não atualizado, trava ocupada) não grava nada.
+ */
+function pagou_flag_boleto_result($invoice_id, $result, $from_cron)
+{
+    $CI = &get_instance();
+    if ($result === 'later') {
+        return false;
+    }
+    if ($result === 'uncertain') {
+        log_activity('Pagou: emissão do boleto da fatura ID ' . $invoice_id . ' sem confirmação da API. Confira no painel da Pagou antes de emitir outro.');
+        $flag = 1;
+    } elseif ($result) {
+        $flag = 1;
+    } else {
+        if (!$from_cron) {
+            return false;
+        }
+        $flag = 2;
+    }
+    $CI->db->where('id', $invoice_id)->update(db_prefix() . 'invoices', ['invoice_pagou' => $flag]);
+
+    return $flag === 1 && $result !== 'uncertain';
+}
+
 
 function pagou_auto_issue_boleto_on_update($invoice_id)
 {
-    $CI = &get_instance();
-    
-    $CI->db->where('invoice_id', $invoice_id);
-    $existing = $CI->db->get(db_prefix() . 'pagou_transactions_boleto')->row();
-    
-    if (!$existing) {
-        return pagou_auto_issue_boleto($invoice_id);
-    }
-    
-    if (!in_array($existing->status, ['paid', 'confirmed'])) {
-        return pagou_update_boleto_info($existing);
-    }
-    
-    return false;
+    return pagou_auto_issue_boleto($invoice_id);
 }
 
 
@@ -273,24 +243,23 @@ function process_pagou_boleto_invoices()
     $CI->db->where("allowed_payment_modes LIKE '%\"pagou_boleto\"%' ");
     $CI->db->where("(invoice_pagou IS NULL OR invoice_pagou = 0)");
     $CI->db->where_in('status', [1, 3, 4]);
+    // Lote pequeno por execução: cada emissão pode esperar a API
+    $CI->db->order_by('id', 'ASC')->limit(20);
     $invoices = $CI->db->get(db_prefix() . 'invoices')->result();
 
     if ($invoices) {
+        require_once(__DIR__ . '/libraries/Pagou_boleto_gateway.php');
         $gateway = new Pagou_boleto_gateway();
 
         foreach ($invoices as $invoice) {
             $data = ['invoice' => $invoice, 'auto_generated' => true];
-            $result = $gateway->process_payment($data);
-
-            // 1 = emitido ou indeterminado (não reemitir às cegas), 2 = recusado pela API
-            if ($result === 'uncertain') {
-                log_activity('Pagou: emissão do boleto da fatura ID ' . $invoice->id . ' sem confirmação da API. Confira no painel da Pagou.');
-                $flag = 1;
-            } else {
-                $flag = $result ? 1 : 2;
+            try {
+                $result = $gateway->process_payment($data);
+            } catch (\Throwable $e) {
+                log_activity('Pagou: erro na emissão automática do boleto da fatura ID ' . $invoice->id . ': ' . $e->getMessage());
+                $result = 'uncertain';
             }
-            $CI->db->where('id', $invoice->id);
-            $CI->db->update(db_prefix() . 'invoices', ['invoice_pagou' => $flag]);
+            pagou_flag_boleto_result($invoice->id, $result, true);
         }
     }
 }
@@ -338,7 +307,8 @@ function pagou_cancel_invoice_pix($invoice_id)
         foreach ($rows as $row) {
             $response = $api->cancel_pix($row->transaction_id);
             if ($response->http_code === 204) {
-                $CI->db->where('id', $row->id)->update($table, ['status' => 'cancelled']);
+                // Pedido aceito; a reconciliação acompanha até o estado final
+                $CI->db->where('id', $row->id)->update($table, ['status' => 'cancel_requested']);
             } else {
                 log_activity('Pagou: não foi possível cancelar o Pix ' . $row->transaction_id . ' da fatura ID ' . $invoice_id . ' (HTTP ' . $response->http_code . ').');
             }

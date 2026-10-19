@@ -51,10 +51,13 @@
    <h3 class="text-center"><?php echo _l('Visualização da Cobrança PIX Avulsa'); ?></h3>
    <hr>
    
-   <?php if (!$this->input->post('cpf_verify')): ?>
+   <?php if (empty($unlocked)): ?>
+       <?php if (!empty($error)): ?>
+           <div class="alert alert-danger"><?php echo htmlspecialchars($error, ENT_QUOTES, 'UTF-8'); ?></div>
+       <?php endif; ?>
        <!-- Exibe o formulário para solicitar o CPF -->
        <p class="text-center"><?php echo _l('Digite seu CPF para desbloquear a visualização da cobrança'); ?></p>
-       <?php echo form_open(site_url('public_charge/view/' . $charge->link)); ?>
+       <?php echo form_open(site_url('pagou/public_charge/view/' . rawurlencode($charge->link))); ?>
            <div class="form-group">
                <label for="cpf_verify"><?php echo _l('CPF'); ?></label>
                <input type="text" name="cpf_verify" id="cpf_verify" class="form-control" required>
@@ -64,9 +67,9 @@
    <?php else: ?>
        <?php if(isset($error)): ?>
            <div class="alert">
-               <?php echo $error; ?>
+               <?php echo htmlspecialchars($error, ENT_QUOTES, 'UTF-8'); ?>
            </div>
-           <?php echo form_open(site_url('public_charge/view/' . $charge->link)); ?>
+           <?php echo form_open(site_url('pagou/public_charge/view/' . rawurlencode($charge->link))); ?>
                <div class="form-group">
                    <label for="cpf_verify"><?php echo _l('CPF'); ?></label>
                    <input type="text" name="cpf_verify" id="cpf_verify" class="form-control" required>

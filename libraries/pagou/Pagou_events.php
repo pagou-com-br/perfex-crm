@@ -333,6 +333,67 @@ class Pagou_events
     }
 
     /**
+     * Sincroniza uma cobrança de cartão com a API; dá baixa só em captured/settled.
+     * Cobrança sem ID (criação indeterminada) é recuperada repetindo a mesma requisição.
+     */
+    public function settle_card($row)
+    {
+        $card = new Pagou_card();
+        if (empty($row->pagou_charge_id)) {
+            $row = $card->recover($row);
+            if (empty($row->pagou_charge_id)) {
+                return $row->status === 'needs_review'
+                    ? [self::RESULT_IGNORED, 'Cobrança de cartão marcada para revisão.']
+                    : [self::RESULT_RETRY, 'Resultado da cobrança de cartão ainda indeterminado.'];
+            }
+        }
+
+        $api = Pagou_api::for_gateway(Pagou_card::GATEWAY);
+        if (!$api) {
+            return [self::RESULT_RETRY, 'Chave do gateway de cartão não configurada.'];
+        }
+        $response = $api->get_card_charge($row->pagou_charge_id);
+        if ($response->not_found()) {
+            return [self::RESULT_IGNORED, 'Cobrança de cartão não encontrada na conta configurada.'];
+        }
+        if (!$response->ok() || !is_array($response->body)) {
+            return [self::RESULT_RETRY, 'Não foi possível consultar a cobrança de cartão.'];
+        }
+
+        $status = strtolower((string) ($response->body['status'] ?? 'unknown'));
+        $previous = $row->status;
+        $update = ['status' => $status, 'updated_at' => date('Y-m-d H:i:s')];
+        if (!empty($response->body['failure_reason'])) {
+            $update['failure_reason'] = mb_substr((string) $response->body['failure_reason'], 0, 255);
+        }
+        if (in_array($status, Pagou_card::FINAL_STATUSES, true)) {
+            $update['request_enc'] = null;
+        }
+
+        if (in_array($status, ['captured', 'settled'], true)) {
+            $value = isset($response->body['value']) ? (int) $response->body['value'] : (int) $row->value_cents;
+            $outcome = $this->register_payment($row->invoice_id, $value / 100, Pagou_card::GATEWAY, $row->pagou_charge_id, [], $response->body['updated_at'] ?? null,
+                'Cartão de crédito confirmado pela Pagou · Cobrança ' . $row->pagou_charge_id . ' · ' . (int) $row->installments . 'x');
+            if ($outcome === false) {
+                return [self::RESULT_RETRY, 'Falha ao registrar o pagamento.'];
+            }
+            $this->ci->db->where('id', $row->id)->update(db_prefix() . 'pagou_card_charges', $update);
+            return [self::RESULT_PROCESSED, 'Pagamento com cartão registrado.'];
+        }
+
+        $this->ci->db->where('id', $row->id)->update(db_prefix() . 'pagou_card_charges', $update);
+
+        if (in_array($status, ['reversed', 'charged_back'], true) && $previous !== $status) {
+            $this->add_invoice_activity($row->invoice_id, ($status === 'reversed' ? 'Estorno' : 'Chargeback')
+                . ' da cobrança de cartão ' . $row->pagou_charge_id . ' informado pela Pagou. Ajuste o pagamento da fatura manualmente.');
+        }
+
+        return in_array($status, ['pending', 'authorized', 'unknown'], true)
+            ? [self::RESULT_RETRY, 'Cobrança de cartão em ' . $status . '.']
+            : [self::RESULT_IGNORED, 'Cobrança de cartão em estado final ' . $status . '.'];
+    }
+
+    /**
      * Confirma um Pix avulso (sem fatura).
      */
     public function settle_avulso($avulso)
@@ -538,8 +599,8 @@ class Pagou_events
         $settlements = db_prefix() . 'pagou_settlements';
 
         foreach ([
-            ['pagou_transactions_pix', 'settle_pix', '-3 days', ['refund_requested', 'partially_refunded']],
-            ['pagou_transactions_boleto', 'settle_boleto', '-60 days', []],
+            ['pagou_transactions_pix', 'settle_pix', '-3 days', ['refund_requested', 'partially_refunded', 'cancel_requested']],
+            ['pagou_transactions_boleto', 'settle_boleto', '-60 days', ['cancel_requested']],
         ] as $job) {
             list($table, $method, $window, $extra_statuses) = $job;
             $full = db_prefix() . $table;
@@ -569,6 +630,21 @@ class Pagou_events
                 $this->ci->db->where('id', $row->id)->update($full, ['last_checked_at' => date('Y-m-d H:i:s')]);
                 $this->$method($row);
             }
+        }
+
+        // Cartão: em andamento, indeterminadas e capturadas recentemente (estorno ou chargeback pelo painel)
+        $cards = $this->ci->db->where('created_at >=', date('Y-m-d H:i:s', strtotime('-30 days')))
+            ->where_in('status', array_merge(Pagou_card::OPEN, ['captured']))
+            ->order_by('last_checked_at IS NULL', 'DESC', false)
+            ->order_by('last_checked_at', 'ASC')
+            ->limit(20)
+            ->get(db_prefix() . 'pagou_card_charges')->result();
+        foreach ($cards as $row) {
+            if (time() > $deadline) {
+                return;
+            }
+            $this->ci->db->where('id', $row->id)->update(db_prefix() . 'pagou_card_charges', ['last_checked_at' => date('Y-m-d H:i:s')]);
+            $this->settle_card($row);
         }
 
         // Retenção: eventos com mais de 90 dias

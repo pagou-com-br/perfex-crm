@@ -635,7 +635,7 @@ function refundTransaction(transactionId, clientName, invoiceNumber, amount) {
         $('#btnConfirmarReembolso').html('<i class="fa fa-spinner fa-spin"></i> Processando...').prop('disabled', true);
         
         // Faz requisição DELETE via fetch para o endpoint de reembolso
-        let endpoint = admin_url + "pagou/reembolso_ajax?transaction_id=" + transactionId + "&payment_type=pix";
+        let endpoint = admin_url + "pagou/reembolso_ajax?transaction_id=" + encodeURIComponent(transactionId) + "&payment_type=pix";
         let payload = {
             amount: refundAmount,
             description: reasonText,

@@ -77,7 +77,7 @@ class Pix_avulso extends AdminController
             'expiration'       => 86400, // 24 horas
             'payer'            => ['name' => mb_substr($nome, 0, 100), 'document' => $cpf],
             'customer_code'    => 'perfex-avulso-' . $insert_id,
-            'notification_url' => site_url('pagou/pagou_webhook/process'),
+            'notification_url' => trim((string) get_option('paymentmethod_pagou_pix_webhook_url')) ?: site_url('pagou/pagou_webhook/process'),
         ]);
 
         $table = db_prefix() . 'pix_avulso';

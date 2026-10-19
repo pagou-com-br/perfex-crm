@@ -148,7 +148,7 @@
         <div class="spinner-border text-primary" role="status" style="vertical-align: middle;">
             <span class="sr-only"><?php echo htmlspecialchars('Carregando...', ENT_QUOTES, 'UTF-8'); ?></span>
         </div>
-        <button class="refresh-button" onclick="window.location.reload();">
+        <button class="refresh-button" onclick="window.location.href = <?php echo htmlspecialchars(json_encode(site_url('invoice/' . (int) $invoice->id . '/' . $invoice->hash)), ENT_QUOTES, 'UTF-8'); ?>;">
             <i class="fa fa-refresh"></i>
             <?php echo htmlspecialchars('Pagamento Realizado?', ENT_QUOTES, 'UTF-8'); ?>
         </button>
@@ -201,11 +201,15 @@
     </script>
 <script>
     const paymentCompleted = <?php echo ($invoice->status == 2) ? 'true' : 'false'; ?>;
+    // A página do Pix é resposta de um POST: depois de pago, volta para a fatura por GET
+    const invoiceUrl = <?php echo json_encode(site_url('invoice/' . (int) $invoice->id . '/' . $invoice->hash)); ?>;
     let checkInterval;
+    let checkAttempts = 0;
     
     function checkPaymentStatus() {
-        if (paymentCompleted) {
-            console.log('Pagamento já confirmado, parando as verificações.');
+        checkAttempts++;
+        // Para depois de 30 minutos
+        if (paymentCompleted || checkAttempts > 360) {
             if (checkInterval) {
                 clearInterval(checkInterval);
             }
@@ -223,11 +227,10 @@
         .then(response => response.json())
         .then(data => {
             if (data.status === 'paid') {
-                console.log('Pagamento confirmado!');
                 if (checkInterval) {
                     clearInterval(checkInterval);
                 }
-                window.location.reload();
+                window.location.href = invoiceUrl;
             }
         })
         .catch(error => {

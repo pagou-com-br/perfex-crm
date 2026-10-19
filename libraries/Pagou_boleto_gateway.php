@@ -11,6 +11,8 @@ defined('BASEPATH') or exit('No direct script access allowed');
 class Pagou_boleto_gateway extends App_gateway
 {
     const UNCERTAIN = 'uncertain';
+    // Nada foi emitido e vale tentar depois (sem chave, banco não atualizado, trava ocupada)
+    const LATER = 'later';
 
     protected $ci;
 
@@ -85,7 +87,7 @@ class Pagou_boleto_gateway extends App_gateway
         $auto = !empty($data['auto_generated']);
 
         if (!Pagou_schema::ready()) {
-            return $this->fail($invoice, $auto, 'O pagamento por boleto está temporariamente indisponível.', true);
+            return $this->fail($invoice, $auto, 'O pagamento por boleto está temporariamente indisponível.', self::LATER);
         }
         if (!pagou_invoice_is_open($invoice)) {
             return $this->fail($invoice, $auto, 'Esta fatura não está aberta para pagamento.');
@@ -96,11 +98,13 @@ class Pagou_boleto_gateway extends App_gateway
         }
         $api = Pagou_api::for_gateway($this->getId());
         if (!$api) {
-            return $this->fail($invoice, $auto, 'O pagamento por boleto está indisponível no momento.', true);
+            return $this->fail($invoice, $auto, 'O pagamento por boleto está indisponível no momento.', self::LATER);
         }
 
         $lock = 'pagou_boleto_invoice_' . $invoice->id;
-        $this->ci->db->query('SELECT GET_LOCK(?, 10) AS l', [$lock]);
+        if (!pagou_acquire_lock($lock)) {
+            return $this->fail($invoice, $auto, 'Já existe uma emissão de boleto em andamento para esta fatura. Tente novamente em instantes.', self::LATER);
+        }
         try {
             $row = $this->current_boleto($api, $invoice, $amount);
             if (is_string($row)) {
@@ -113,7 +117,7 @@ class Pagou_boleto_gateway extends App_gateway
                 }
             }
         } finally {
-            $this->ci->db->query('SELECT RELEASE_LOCK(?)', [$lock]);
+            pagou_release_lock($lock);
         }
 
         if ($auto) {
@@ -180,10 +184,15 @@ class Pagou_boleto_gateway extends App_gateway
                     return $this->reload($row);
                 }
                 if (!$this->is_expired($row, $again ?: $charge)) {
-                    return 'Não foi possível substituir o boleto atual. Use o boleto já emitido ou tente mais tarde.';
+                    // Cancelamento recusado e boleto ainda pagável: segue com o boleto vigente
+                    set_alert('warning', 'O valor da fatura mudou, mas o boleto já emitido não pôde ser substituído. Ele continua válido para pagamento.');
+                    return $this->reload($row);
                 }
+                $this->ci->db->where('id', $row->id)->update($table, ['status' => 'expired']);
+                continue;
             }
-            $this->ci->db->where('id', $row->id)->update($table, ['status' => 'expired']);
+            // Pedido de cancelamento aceito (204): a reconciliação acompanha até o estado final
+            $this->ci->db->where('id', $row->id)->update($table, ['status' => 'cancel_requested']);
         }
 
         return null;
@@ -195,26 +204,23 @@ class Pagou_boleto_gateway extends App_gateway
     private function recover_uncertain(Pagou_api $api, $row)
     {
         $table = db_prefix() . 'pagou_transactions_boleto';
-        $list = $api->list_charges([
-            'created_at_from' => pagou_utc_filter_time(strtotime($row->date_created) - 300),
-            'created_at_to'   => pagou_utc_filter_time(time() + 60),
-            'limit'           => 100,
-            'offset'          => 0,
-        ]);
-        if (!$list->ok()) {
+        $known = array_column($this->ci->db->select('transaction_id')->where('invoice_id', $row->invoice_id)->get($table)->result_array(), 'transaction_id');
+        $item = pagou_find_created_charge(function ($filters) use ($api) {
+            return $api->list_charges($filters);
+        }, $row, $known);
+
+        if ($item === false) {
             return false;
         }
-        foreach ((array) $list->body as $item) {
-            if (is_array($item) && ($item['customer_code'] ?? '') === $row->customer_code && !empty($item['id'])) {
-                $this->ci->db->where('id', $row->id)->update($table, [
-                    'transaction_id' => $item['id'],
-                    'status'         => pagou_normalize_status($item['status'] ?? 1, 'boleto'),
-                    'api_response'   => json_encode($item),
-                ]);
-                return $this->reload($row);
-            }
+        if ($item) {
+            $this->ci->db->where('id', $row->id)->update($table, [
+                'transaction_id' => $item['id'],
+                'status'         => pagou_normalize_status($item['status'] ?? 1, 'boleto'),
+                'api_response'   => json_encode(pagou_redact($item)),
+            ]);
+            return $this->reload($row);
         }
-        if (time() - strtotime($row->date_created) < 120) {
+        if (time() < strtotime($row->date_created) + 360) {
             return false;
         }
         $this->ci->db->where('id', $row->id)->update($table, ['status' => 'failed']);
@@ -278,21 +284,21 @@ class Pagou_boleto_gateway extends App_gateway
             $this->ci->db->where('id', $row_id)->update($table, [
                 'transaction_id' => $response->body['id'],
                 'status'         => pagou_normalize_status($response->body['status'] ?? 1, 'boleto'),
-                'api_response'   => json_encode($response->body),
+                'api_response'   => json_encode(pagou_redact($response->body)),
             ]);
             $row = $this->ci->db->where('id', $row_id)->get($table)->row();
             pagou_save_linked_pix($invoice->id, json_decode(json_encode($response->body)));
             return $row;
         }
 
-        if ($response->uncertain()) {
+        if ($response->uncertain() || $response->http_code === 409) {
             $this->ci->db->where('id', $row_id)->update($table, ['status' => 'uncertain']);
             $uncertain = true;
             $error = 'A Pagou não confirmou a emissão do boleto. Aguarde alguns instantes e abra a fatura de novo.';
             return null;
         }
 
-        $this->ci->db->where('id', $row_id)->update($table, ['status' => 'failed', 'api_response' => json_encode($response->body)]);
+        $this->ci->db->where('id', $row_id)->update($table, ['status' => 'failed', 'api_response' => json_encode(pagou_redact($response->body))]);
         $error = 'Não foi possível gerar o boleto: ' . $response->error_message();
 
         return null;
@@ -342,7 +348,8 @@ class Pagou_boleto_gateway extends App_gateway
     {
         $due = null;
         if (!empty($charge->due_at)) {
-            $due = date('Y-m-d', strtotime($charge->due_at));
+            // Data do vencimento como informada (sem conversão de fuso)
+            $due = substr((string) $charge->due_at, 0, 10);
         } elseif (!empty($row->api_request)) {
             $request = json_decode($row->api_request, true);
             $due = $request['due_date'] ?? null;
@@ -369,6 +376,9 @@ class Pagou_boleto_gateway extends App_gateway
     {
         pagou_log('boleto', 'error', 'Fatura ID ' . $invoice->id . ': ' . $message);
         if ($auto) {
+            if ($uncertain === self::LATER) {
+                return self::LATER;
+            }
             return $uncertain ? self::UNCERTAIN : false;
         }
         set_alert('danger', $message);
@@ -441,12 +451,7 @@ class Pagou_boleto_gateway extends App_gateway
         $client = $this->ci->clients_model->get($invoice->clientid);
         $missing = [];
 
-        $name = '';
-        if ($client && !empty($client->company)) {
-            $name = $client->company;
-        } elseif ($client) {
-            $name = trim(($client->firstname ?? '') . ' ' . ($client->lastname ?? ''));
-        }
+        $name = pagou_client_display_name($client);
         $document = preg_replace('/\D/', '', (string) ($client->vat ?? ''));
 
         $street = (string) ($invoice->billing_street ?? '');

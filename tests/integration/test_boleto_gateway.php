@@ -83,7 +83,7 @@ api(['GET /v1/charges/b-old' => $charge('b-old', 2, ['due_at' => date('Y-m-d', s
      'POST /v1/charges' => ['code' => 201, 'body' => ['id' => 'b-2', 'status' => 1]], 'GET /v1/charges/b-2' => $charge('b-2', 2)]);
 $r = run(21, false);
 t('cancela o vencido e emite novo com vencimento hoje', last_call('DELETE /v1/charges/b-old') !== null && json_decode(last_call('POST /v1/charges')['body'], true)['due_date'] === max(date('Y-m-d'), gmdate('Y-m-d')));
-t('antigo marcado expired', brows(21)[0]->status === 'expired');
+t('antigo aguarda o cancelamento (cancel_requested)', brows(21)[0]->status === 'cancel_requested');
 
 echo "Boleto da 1.x com due_date local errado mas ainda válido na API\n";
 $db->insert('tblinvoices', ['id' => 22, 'total' => 120, 'status' => 4, 'invoice_pagou' => 1, 'hash' => 'h22', 'duedate' => date('Y-m-d', strtotime('-10 days')), 'clientid' => 1]);
@@ -133,6 +133,25 @@ $code = brows(26)[0]->customer_code;
 reset_calls(); api(['GET /v1/charges' => ['code' => 200, 'body' => [['id' => 'b-5', 'customer_code' => $code, 'status' => 1]]], 'GET /v1/charges/b-5' => $charge('b-5', 2)]);
 $r = run(26, true);
 t('recupera pela listagem sem nova emissão', is_array($r) && $r['transaction_id'] === 'b-5' && last_call('POST /v1/charges') === null);
+
+echo "Revisão: boleto vigente mantido, later e due_at\n";
+$db->insert('tblinvoices', ['id' => 27, 'total' => 150, 'status' => 1, 'invoice_pagou' => 1, 'hash' => 'h27', 'duedate' => date('Y-m-d', strtotime('+5 days')), 'clientid' => 1]);
+$db->insert('tblpagou_transactions_boleto', ['invoice_id' => 27, 'transaction_id' => 'b-keep', 'amount' => 120, 'status' => 'active', 'date_created' => date('Y-m-d H:i:s'), 'due_date' => date('Y-m-d', strtotime('+5 days'))]);
+reset_calls();
+api(['GET /v1/charges/b-keep' => $charge('b-keep', 2), 'DELETE /v1/charges/b-keep' => ['code' => 400, 'body' => ['error' => 'x', 'code' => 'CHARGE_2']]]);
+$r = run(27, false);
+t('valor mudou e cancelamento recusado: mostra o boleto vigente', $r === true && $GLOBALS['__view'][1]['pagou_transaction_id'] === 'b-keep' && last_call('POST /v1/charges') === null);
+$saved = get_option('paymentmethod_pagou_boleto_api_token');
+update_option('paymentmethod_pagou_boleto_api_token', '');
+$db->insert('tblinvoices', ['id' => 28, 'total' => 60, 'status' => 1, 'invoice_pagou' => 0, 'hash' => 'h28', 'duedate' => date('Y-m-d', strtotime('+5 days')), 'clientid' => 1]);
+t('sem chave no modo automático: later (tentar depois)', run(28, true) === 'later');
+update_option('paymentmethod_pagou_boleto_api_token', $saved);
+$db->insert('tblinvoices', ['id' => 29, 'total' => 120, 'status' => 1, 'invoice_pagou' => 1, 'hash' => 'h29', 'duedate' => date('Y-m-d'), 'clientid' => 1]);
+$db->insert('tblpagou_transactions_boleto', ['invoice_id' => 29, 'transaction_id' => 'b-utc', 'amount' => 120, 'status' => 'active', 'date_created' => date('Y-m-d H:i:s'), 'due_date' => date('Y-m-d', strtotime('-3 days'))]);
+reset_calls();
+api(['GET /v1/charges/b-utc' => $charge('b-utc', 2, ['due_at' => date('Y-m-d', strtotime('-1 day')) . 'T00:00:00Z'])]);
+run(29, false);
+t('due_at à meia-noite UTC não antecipa o vencimento', last_call('DELETE /v1/charges/b-utc') === null);
 
 echo "\n$ok ok, $fail falhas\n";
 exit($fail ? 1 : 0);

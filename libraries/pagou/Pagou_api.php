@@ -127,6 +127,24 @@ class Pagou_api
      */
     public function request($method, $path, $body = null, array $query = [])
     {
+        $raw = $body !== null ? json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) : null;
+
+        return $this->send($method, $path, $raw, $query, []);
+    }
+
+    /**
+     * Envia um corpo JSON já serializado. Usado nas escritas de cartão com Idempotency-Key,
+     * que precisam repetir exatamente os mesmos bytes.
+     *
+     * @param string      $method
+     * @param string      $path
+     * @param string|null $raw_body
+     * @param array       $query
+     * @param array       $extra_headers ['Idempotency-Key' => '...']
+     * @return Pagou_api_response
+     */
+    public function send($method, $path, $raw_body, array $query = [], array $extra_headers = [])
+    {
         $url = $this->base_url . $path;
         if ($query) {
             $url .= '?' . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
@@ -148,9 +166,12 @@ class Pagou_api
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
         ];
-        if ($body !== null) {
+        foreach ($extra_headers as $name => $value) {
+            $headers[] = $name . ': ' . $value;
+        }
+        if ($raw_body !== null) {
             $headers[] = 'Content-Type: application/json';
-            $options[CURLOPT_POSTFIELDS] = json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            $options[CURLOPT_POSTFIELDS] = $raw_body;
         }
         $options[CURLOPT_HTTPHEADER] = $headers;
         curl_setopt_array($ch, $options);
@@ -169,7 +190,7 @@ class Pagou_api
         pagou_log('api', $http_code >= 200 && $http_code < 300 ? 'debug' : 'error', "{$method} {$path} -> HTTP {$http_code}", [
             'duration_ms' => (int) round((microtime(true) - $started) * 1000),
             'transport_error' => $transport_error,
-            'request' => $body,
+            'request' => $raw_body !== null ? json_decode($raw_body, true) : null,
             'response' => $decoded,
         ]);
 
@@ -210,6 +231,31 @@ class Pagou_api
             'reason'      => (int) $reason,
             'description' => (string) $description,
         ]);
+    }
+
+    // ---------------------------------------------------------------- Cartão
+
+    /**
+     * Cria a cobrança de cartão com o corpo exato e a chave de idempotência gravados antes do envio.
+     */
+    public function create_card_charge($raw_body, $idempotency_key)
+    {
+        return $this->send('POST', '/v1/creditcard/charges', $raw_body, [], ['Idempotency-Key' => $idempotency_key]);
+    }
+
+    public function get_card_charge($id)
+    {
+        return $this->request('GET', '/v1/creditcard/charges/' . rawurlencode($id));
+    }
+
+    public function cancel_card_charge($id, $idempotency_key)
+    {
+        return $this->send('DELETE', '/v1/creditcard/charges/' . rawurlencode($id), null, [], ['Idempotency-Key' => $idempotency_key]);
+    }
+
+    public function reverse_card_charge($id, $raw_body, $idempotency_key)
+    {
+        return $this->send('PUT', '/v1/creditcard/charges/' . rawurlencode($id) . '/reverse', $raw_body, [], ['Idempotency-Key' => $idempotency_key]);
     }
 
     // ---------------------------------------------------------------- Boleto
