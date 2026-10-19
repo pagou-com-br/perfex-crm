@@ -2,11 +2,11 @@
 defined('BASEPATH') or exit('No direct script access allowed');
 
 /**
- * Esquema da versão 2.x, idempotente: usado pela instalação e pelas migrations 200 e 210.
+ * Esquema da versão 2.x, idempotente: usado pela instalação e pelas migrations 200, 210 e 220.
  */
 class Pagou_schema
 {
-    const VERSION = 210;
+    const VERSION = 220;
 
     /**
      * @param bool $is_upgrade true quando vem de uma versão anterior (migration)
@@ -88,6 +88,58 @@ class Pagou_schema
                 UNIQUE KEY `pagou_charge_id` (`pagou_charge_id`),
                 KEY `invoice_status` (`invoice_id`, `status`)
             ) ENGINE=InnoDB DEFAULT CHARSET=" . $db->char_set . ';');
+        }
+
+        // 2.2: split (recebedores, regras e acompanhamento da distribuição)
+        $recipients = db_prefix() . 'pagou_split_recipients';
+        if (!$db->table_exists($recipients)) {
+            $db->query("CREATE TABLE `{$recipients}` (
+                `id` int(11) NOT NULL AUTO_INCREMENT,
+                `name` varchar(150) NOT NULL,
+                `customer_uuid` char(36) NOT NULL,
+                `active` tinyint(1) NOT NULL DEFAULT 1,
+                `notes` varchar(255) DEFAULT NULL,
+                `created_at` datetime NOT NULL,
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `customer_uuid` (`customer_uuid`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=" . $db->char_set . ';');
+        }
+        $rules = db_prefix() . 'pagou_split_rules';
+        if (!$db->table_exists($rules)) {
+            $db->query("CREATE TABLE `{$rules}` (
+                `id` int(11) NOT NULL AUTO_INCREMENT,
+                `scope` varchar(10) NOT NULL,
+                `scope_id` int(11) NOT NULL DEFAULT 0,
+                `recipient_id` int(11) NOT NULL,
+                `type` varchar(10) NOT NULL,
+                `value` decimal(15,4) NOT NULL,
+                `methods` varchar(30) NOT NULL,
+                `active` tinyint(1) NOT NULL DEFAULT 1,
+                `created_at` datetime NOT NULL,
+                PRIMARY KEY (`id`),
+                KEY `scope` (`scope`, `scope_id`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=" . $db->char_set . ';');
+        }
+        $snapshots = db_prefix() . 'pagou_split_snapshots';
+        if (!$db->table_exists($snapshots)) {
+            $db->query("CREATE TABLE `{$snapshots}` (
+                `id` int(11) NOT NULL AUTO_INCREMENT,
+                `method` varchar(10) NOT NULL,
+                `charge_id` varchar(191) NOT NULL,
+                `invoice_id` int(11) NOT NULL,
+                `request_json` text,
+                `split_status` tinyint(4) DEFAULT NULL,
+                `fee` decimal(15,2) DEFAULT NULL,
+                `allocations_json` text,
+                `last_checked_at` datetime DEFAULT NULL,
+                `created_at` datetime NOT NULL,
+                `updated_at` datetime NOT NULL,
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `method_charge` (`method`, `charge_id`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=" . $db->char_set . ';');
+        }
+        if (get_option('pagou_split_min_margin_pct') === '') {
+            self::set_option('pagou_split_min_margin_pct', '10');
         }
 
         self::add_column($pix, 'boleto_transaction_id', 'varchar(255) DEFAULT NULL');

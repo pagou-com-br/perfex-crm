@@ -518,6 +518,7 @@ function pagou_load_libraries()
     require_once __DIR__ . '/../libraries/pagou/Pagou_events.php';
     require_once __DIR__ . '/../libraries/pagou/Pagou_schema.php';
     require_once __DIR__ . '/../libraries/pagou/Pagou_card.php';
+    require_once __DIR__ . '/../libraries/pagou/Pagou_split.php';
 }
 
 /**

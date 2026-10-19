@@ -3,7 +3,7 @@ require __DIR__ . '/bootstrap.php';
 $db = get_instance()->db;
 
 // ---------------------------------------------------------------- esquema mínimo do Perfex + tabelas 1.x do módulo
-foreach (['tbloptions', 'tblinvoices', 'tblinvoicepaymentrecords', 'tblpagou_transactions_pix', 'tblpagou_transactions_boleto', 'tblpix_avulso', 'tblpagou_webhook_events', 'tblpagou_settlements', 'tblpagou_card_charges'] as $t) {
+foreach (['tbloptions', 'tblinvoices', 'tblinvoicepaymentrecords', 'tblpagou_transactions_pix', 'tblpagou_transactions_boleto', 'tblpix_avulso', 'tblpagou_webhook_events', 'tblpagou_settlements', 'tblpagou_card_charges', 'tblpagou_split_recipients', 'tblpagou_split_rules', 'tblpagou_split_snapshots'] as $t) {
     $db->query("DROP TABLE IF EXISTS `$t`");
 }
 $db->query("CREATE TABLE tbloptions (id int auto_increment primary key, name varchar(191) unique, value longtext, autoload int)");

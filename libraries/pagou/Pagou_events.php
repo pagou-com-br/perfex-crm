@@ -245,6 +245,9 @@ class Pagou_events
         }
 
         $body = $response->body;
+        if (isset($body['split'])) {
+            (new Pagou_split())->track('pix', $pix->transaction_id, $body['split']);
+        }
         $status = isset($body['status']) ? (int) $body['status'] : 0;
         $refund = isset($body['refund']) && is_array($body['refund']) ? $body['refund'] : null;
         $was_paid = $status === 4 || $status === 5 || ($refund !== null && !empty($body['paid_at']));
@@ -360,6 +363,9 @@ class Pagou_events
             return [self::RESULT_RETRY, 'Não foi possível consultar a cobrança de cartão.'];
         }
 
+        if (isset($response->body['split'])) {
+            (new Pagou_split())->track('cartao', $row->pagou_charge_id, $response->body['split']);
+        }
         $status = strtolower((string) ($response->body['status'] ?? 'unknown'));
         $previous = $row->status;
         $update = ['status' => $status, 'updated_at' => date('Y-m-d H:i:s')];
@@ -556,6 +562,9 @@ class Pagou_events
             return null;
         }
         $charge = json_decode(json_encode($response->body));
+        if (isset($charge->split)) {
+            (new Pagou_split())->track('boleto', $boleto->transaction_id, $charge->split);
+        }
 
         $status = pagou_boleto_api_is_paid($charge) ? 'paid' : pagou_normalize_status($charge->status ?? null, 'boleto');
         $update = [
@@ -645,6 +654,29 @@ class Pagou_events
             }
             $this->ci->db->where('id', $row->id)->update(db_prefix() . 'pagou_card_charges', ['last_checked_at' => date('Y-m-d H:i:s')]);
             $this->settle_card($row);
+        }
+
+        // Split: distribuições ainda não concluídas (pagamento confirmado não significa repasse concluído)
+        $api_by_method = [
+            'pix'    => ['pagou_pix', 'get_pix'],
+            'boleto' => ['pagou_boleto', 'get_charge'],
+            'cartao' => [Pagou_card::GATEWAY, 'get_card_charge'],
+        ];
+        $split = new Pagou_split();
+        foreach ($split->pending_snapshots(10) as $snapshot) {
+            if (time() > $deadline || !isset($api_by_method[$snapshot->method])) {
+                break;
+            }
+            list($gateway_id, $getter) = $api_by_method[$snapshot->method];
+            $api = Pagou_api::for_gateway($gateway_id);
+            if (!$api) {
+                continue;
+            }
+            $response = $api->$getter($snapshot->charge_id);
+            $this->ci->db->where('id', $snapshot->id)->update(db_prefix() . 'pagou_split_snapshots', ['last_checked_at' => date('Y-m-d H:i:s')]);
+            if ($response->ok() && is_array($response->body) && isset($response->body['split'])) {
+                $split->track($snapshot->method, $snapshot->charge_id, $response->body['split']);
+            }
         }
 
         // Retenção: eventos com mais de 90 dias

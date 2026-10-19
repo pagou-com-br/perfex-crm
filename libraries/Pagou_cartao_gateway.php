@@ -24,6 +24,7 @@ class Pagou_cartao_gateway extends App_gateway
             ['name' => 'max_installments', 'label' => 'PARCELAS | Número máximo de parcelas oferecidas (1 = só à vista; até 12, limitado pela bandeira)', 'type' => 'input', 'default_value' => '1'],
             ['name' => 'min_installment_value', 'label' => 'PARCELAS | Valor mínimo de cada parcela em reais (0 = sem mínimo)', 'type' => 'input', 'default_value' => '0'],
             ['name' => 'currencies', 'label' => 'MOEDA | Códigos aceitos', 'type' => 'input', 'default_value' => 'BRL'],
+            ['name' => 'enable_split', 'label' => 'SPLIT | Aplicar as regras de split da Pagou (exige split habilitado na conta e recebedores autorizados no painel)', 'type' => 'yes_no', 'default_value' => 0],
         ]);
 
         hooks()->add_action('before_add_payment_gateway', [$this, 'register_gateway']);

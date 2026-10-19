@@ -47,6 +47,7 @@ class Pagou_boleto_gateway extends App_gateway
 
             ['name' => 'webhook_url', 'label' => 'WEBHOOK | URL personalizada (deixe em branco para usar a padrão do módulo)', 'type' => 'input', 'default_value' => ''],
             ['name' => 'enable_pix_with_boleto', 'label' => 'PIX | Mostrar também o Pix vinculado ao boleto, quando a Pagou fornecer', 'type' => 'yes_no', 'default_value' => 1],
+            ['name' => 'enable_split', 'label' => 'SPLIT | Aplicar as regras de split da Pagou (exige split habilitado na conta e recebedores autorizados no painel)', 'type' => 'yes_no', 'default_value' => 0],
         ]);
 
         hooks()->add_action('before_add_payment_gateway', [$this, 'register_gateway']);
@@ -255,6 +256,21 @@ class Pagou_boleto_gateway extends App_gateway
             ],
         ] + $this->charges($due_date);
 
+        // Split: regras do Perfex resolvidas na criação; regra inválida bloqueia a emissão
+        $split = [];
+        if (Pagou_split::enabled_for('pagou_boleto')) {
+            $split = (new Pagou_split())->resolve($invoice, 'boleto', $amount, $split_error);
+            if ($split_error) {
+                $this->ci->load->model('invoices_model');
+                $this->ci->invoices_model->log_invoice_activity($invoice->id, 'Pagou: cobrança não emitida. ' . $split_error);
+                $error = 'O pagamento por boleto está indisponível no momento (configuração de split).';
+                return null;
+            }
+            if ($split) {
+                $body['split'] = $split;
+            }
+        }
+
         $table = db_prefix() . 'pagou_transactions_boleto';
         $this->ci->db->insert($table, [
             'invoice_id'     => $invoice->id,
@@ -288,6 +304,7 @@ class Pagou_boleto_gateway extends App_gateway
             ]);
             $row = $this->ci->db->where('id', $row_id)->get($table)->row();
             pagou_save_linked_pix($invoice->id, json_decode(json_encode($response->body)));
+            (new Pagou_split())->snapshot('boleto', $response->body['id'], $invoice->id, $split, $response->body['split'] ?? null);
             return $row;
         }
 

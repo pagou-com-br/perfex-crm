@@ -40,7 +40,7 @@ PHP="php"
 php -m | grep -qi '^mysqli$' || PHP="php -d extension=mysqli"
 
 status=0
-for test in test_events test_pix_gateway test_boleto_gateway test_card; do
+for test in test_events test_pix_gateway test_boleto_gateway test_card test_split; do
     echo "== $test"
     $PHP "$test.php" || status=1
 done

@@ -4,7 +4,7 @@ defined('BASEPATH') or exit('No direct script access allowed');
 /*
 Module Name: Pagou Integração Perfex CRM
 Description: Gateway de pagamento www.pagou.com.br: PIX, Boleto e Cartão de Crédito para Perfex CRM
-Version: 2.1.0
+Version: 2.2.0
 Requires at least: 3.2.0
 Author: Liquida SP
 Author URI: https://liquidasp.com.br/
@@ -29,6 +29,7 @@ function pagou_module_permissions()
         'access_pix_avulso' => 'Acessar PIX Avulso',
         'access_reembolso'  => 'Acessar Reembolso de Pagamentos',
         'card_reverse'      => 'Estornar cobranças de cartão',
+        'manage_split'      => 'Configurar split de pagamento',
     ];
 
     register_staff_capabilities('pagou_module', $permissions, _l('Pagou Integração'));
@@ -63,7 +64,7 @@ hooks()->add_action('admin_init', function () {
 
     pagou_remember_api_tokens();
 
-    if (staff_can('access_pix_avulso', 'pagou_module') || staff_can('access_reembolso', 'pagou_module') || staff_can('card_reverse', 'pagou_module')) {
+    if (staff_can('access_pix_avulso', 'pagou_module') || staff_can('access_reembolso', 'pagou_module') || staff_can('card_reverse', 'pagou_module') || staff_can('manage_split', 'pagou_module')) {
         $CI->app_menu->add_sidebar_menu_item('pagou-menu', [
             'name' => 'Pagou',
             "icon" => "fa fa-usd",
@@ -94,6 +95,15 @@ hooks()->add_action('admin_init', function () {
                 'name' => 'Cobranças de Cartão',
                 'href' => admin_url('pagou/card_admin'),
                 'position' => 15,
+            ]);
+        }
+
+        if (staff_can('manage_split', 'pagou_module')) {
+            $CI->app_menu->add_sidebar_children_item('pagou-menu', [
+                'slug' => 'pagou-split',
+                'name' => 'Split de Pagamento',
+                'href' => admin_url('pagou/split_admin'),
+                'position' => 20,
             ]);
         }
         

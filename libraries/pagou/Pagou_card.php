@@ -89,6 +89,18 @@ class Pagou_card
                 'description'  => mb_substr($description, 0, 255),
                 'antifraud'    => ['ip' => $buyer_ip],
             ];
+            // Split (valores fixos em reais) entra nos bytes idempotentes da criação
+            $split = [];
+            if (Pagou_split::enabled_for(self::GATEWAY)) {
+                $split = (new Pagou_split())->resolve($invoice, 'cartao', $amount, $split_error);
+                if ($split_error) {
+                    $this->log_activity($invoice->id, 'Pagou: cobrança de cartão não criada. ' . $split_error);
+                    return ['result' => 'error', 'message' => 'O pagamento com cartão está indisponível no momento.'];
+                }
+                if ($split) {
+                    $body['split'] = $split;
+                }
+            }
             $raw = json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
             $key = 'perfex-card-' . bin2hex(random_bytes(16));
             $now = date('Y-m-d H:i:s');
@@ -110,6 +122,9 @@ class Pagou_card
 
             $response = $api->create_card_charge($raw, $key);
             $row = $this->apply_create_response($row_id, $response);
+            if ($split && $row && $row->pagou_charge_id) {
+                (new Pagou_split())->snapshot('cartao', $row->pagou_charge_id, $invoice->id, $split, $response->body['split'] ?? null);
+            }
         } finally {
             pagou_release_lock($lock);
         }

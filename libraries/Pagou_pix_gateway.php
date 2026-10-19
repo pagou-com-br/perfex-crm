@@ -60,6 +60,7 @@ class Pagou_pix_gateway extends App_gateway
             ['name' => 'interest_value', 'label' => '     ⤷ Valor conforme o tipo (ex.: 1 = 1% ao mês)', 'type' => 'input', 'default_value' => '0'],
 
             ['name' => 'webhook_url', 'label' => 'WEBHOOK | URL personalizada (deixe em branco para usar a padrão do módulo)', 'type' => 'input', 'default_value' => ''],
+            ['name' => 'enable_split', 'label' => 'SPLIT | Aplicar as regras de split da Pagou (exige split habilitado na conta e recebedores autorizados no painel)', 'type' => 'yes_no', 'default_value' => 0],
         ]);
 
         hooks()->add_action('before_add_payment_gateway', [$this, 'register_gateway']);
@@ -290,6 +291,21 @@ class Pagou_pix_gateway extends App_gateway
             $body['expiration'] = $expiration_seconds;
         }
 
+        // Split: regras do Perfex resolvidas na criação; regra inválida bloqueia a emissão
+        $split = [];
+        if (Pagou_split::enabled_for('pagou_pix')) {
+            $split = (new Pagou_split())->resolve($invoice, 'pix', $amount, $split_error);
+            if ($split_error) {
+                $this->ci->load->model('invoices_model');
+                $this->ci->invoices_model->log_invoice_activity($invoice->id, 'Pagou: cobrança não emitida. ' . $split_error);
+                $error = 'O pagamento por Pix está indisponível no momento (configuração de split).';
+                return null;
+            }
+            if ($split) {
+                $body['split'] = $split;
+            }
+        }
+
         // Linha local antes da chamada: permite reconciliar se o resultado for indeterminado
         $table = db_prefix() . 'pagou_transactions_pix';
         $this->ci->db->insert($table, [
@@ -325,6 +341,7 @@ class Pagou_pix_gateway extends App_gateway
                 'status'         => isset($result['status']) ? pagou_normalize_status($result['status']) : 'active',
                 'api_response'   => json_encode(pagou_redact($result)),
             ]);
+            (new Pagou_split())->snapshot('pix', $result['id'], $invoice->id, $split, $result['split'] ?? null);
             return $this->ci->db->where('id', $row_id)->get($table)->row();
         }
 
