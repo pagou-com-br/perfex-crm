@@ -3,10 +3,11 @@ defined('BASEPATH') or exit('No direct script access allowed');
 
 class Pix_avulso_model extends App_Model {
 
-    protected $table = 'pix_avulso';
+    protected $table;
 
     public function __construct(){
         parent::__construct();
+        $this->table = db_prefix() . 'pix_avulso';
     }
     
     /**

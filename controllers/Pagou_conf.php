@@ -19,6 +19,9 @@ class Pagou_conf extends AdminController
     public function __construct()
     {
         parent::__construct();
+        if (!is_admin()) {
+            access_denied('Pagou Configurações');
+        }
         $this->load->model('pagou_conf_model');
 
         // Recupera o status dos logs a partir da tabela tbloptions (campo value onde name = "pagou_logs_api")
@@ -105,6 +108,20 @@ class Pagou_conf extends AdminController
             log_message('info', '[Pagou_conf::save] Nenhum POST detectado. Redirecionando para a página de configurações.');
         }
         // Caso não seja POST, apenas redireciona
+        redirect(admin_url('pagou/pagou_conf'));
+    }
+
+    /**
+     * Descarta as chaves de API anteriores guardadas para validar webhooks.
+     * Acesso via POST: /admin/pagou/pagou_conf/forget_keys
+     */
+    public function forget_keys()
+    {
+        if ($this->input->post()) {
+            pagou_forget_previous_api_tokens();
+            log_activity('Pagou: chaves de API anteriores descartadas por ' . get_staff_full_name(get_staff_user_id()));
+            set_alert('success', 'Chaves de API anteriores descartadas.');
+        }
         redirect(admin_url('pagou/pagou_conf'));
     }
 }

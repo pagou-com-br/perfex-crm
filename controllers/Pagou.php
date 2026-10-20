@@ -116,35 +116,6 @@ class Pagou extends AdminController
     }
 
     /**
-     * Gera uma imagem de código de barras para o boleto.
-     *
-     * @param string $data Código de barras do boleto.
-     */
-    public function generate_barcode($data)
-    {
-        // Configura cabeçalho para imagem PNG
-        header('Content-Type: image/png');
-
-        try {
-            // Instancia o objeto TypeCode128
-            $barcodeGenerator = new TypeCode128();
-            $barcode = $barcodeGenerator->getBarcode($data); // Gera o código de barras
-
-            // Configura o renderizador para PNG
-            $renderer = new PngRenderer();
-
-            // Gera e exibe o código de barras como imagem
-            $this->writeLog('debug', "Gerando código de barras para o dado: {$data}");
-            echo $renderer->render($barcode, 400, 100); // Ajuste os tamanhos conforme necessário
-        } catch (Exception $e) {
-            // Trata erros
-            $this->writeLog('error', 'Erro ao gerar código de barras: ' . $e->getMessage());
-            http_response_code(500);
-            echo 'Erro ao gerar código de barras: ' . $e->getMessage();
-        }
-    }
-
-    /**
      * Exibe a página de PIX Avulso.
      */
     public function pix_avulso()
@@ -159,6 +130,10 @@ class Pagou extends AdminController
      */
     public function cobrancas_emitidas()
     {
+        if (!staff_can('access_reembolso', 'pagou_module')) {
+            access_denied('Reembolso de Pagamentos');
+        }
+
         $this->writeLog('info', 'Exibindo a página de Cobranças Emitidas.');
         $data['title'] = 'Cobranças Emitidas Invoice x Pagou';
 
@@ -186,6 +161,19 @@ class Pagou extends AdminController
      */
     public function reembolso_ajax()
     {
+        pagou_load_libraries();
+        if ($this->input->method() !== 'delete') {
+            header('Content-Type: application/json');
+            echo json_encode(['status' => 'error', 'message' => 'Método não permitido.']);
+            return;
+        }
+
+        if (!staff_can('access_reembolso', 'pagou_module')) {
+            header('Content-Type: application/json');
+            echo json_encode(['status' => 'error', 'message' => 'Sem permissão para esta ação.']);
+            return;
+        }
+
         // Início do processamento de reembolso
         $this->writeLog('info', 'Iniciando método reembolso_ajax.');
 
@@ -233,7 +221,7 @@ class Pagou extends AdminController
         $this->writeLog('info', "Transação PIX encontrada: " . json_encode($transaction));
 
         // Verifica se a transação já foi reembolsada
-        if ($transaction->status === 'refunded') {
+        if (in_array($transaction->status, ['refunded', 'partially_refunded'], true)) {
             $this->writeLog('warning', "Transação já reembolsada: {$transaction_id}");
             echo json_encode(['status' => 'error', 'message' => 'Esta transação já foi reembolsada.']);
             return;
@@ -241,39 +229,73 @@ class Pagou extends AdminController
 
         // Determina o identificador do QR Code / transaction_id
         $transaction_id_to_use = $transaction->transaction_id;
-        $this->writeLog('debug', "ID da transação utilizado: {$transaction_id_to_use}");
 
-        // URL da API Pagou para reembolso PIX
-        $api_url = "https://api.pagou.com.br/v1/pix/{$transaction_id_to_use}/refund";
-        $this->writeLog('debug', "URL da API para reembolso PIX: {$api_url}");
+        if (!empty($transaction->boleto_transaction_id)) {
+            echo json_encode(['status' => 'error', 'message' => 'Este Pix pertence a um boleto e não pode ser estornado por aqui.']);
+            return;
+        }
 
-        // Prepara o payload para requisição DELETE
-        $payload_refund = [
-            'amount'      => $refund_amount,
-            'description' => $description,
-            'reason'      => $reason
-        ];
-        $this->writeLog('debug', "Payload para reembolso PIX preparado: " . json_encode($payload_refund));
+        // Valida o valor no servidor: positivo, até 2 casas e sem superar o valor pago
+        $refund_amount = round($refund_amount, 2);
+        $paid_amount = (float) $transaction->amount_final;
+        if ($refund_amount <= 0 || ($paid_amount > 0 && $refund_amount > $paid_amount)) {
+            echo json_encode(['status' => 'error', 'message' => 'Valor de estorno inválido.']);
+            return;
+        }
+        if (!in_array($reason, [1, 2, 3, 4], true)) {
+            $reason = 3; // Devolução solicitada pelo cliente final
+        }
+        if (trim((string) $description) === '') {
+            $description = 'Devolução solicitada pelo cliente';
+        }
 
-        // Carrega a API key do gateway (criptografada)
-        $encryptedKey = get_option('paymentmethod_pagou_pix_api_token');
-
-        // Descriptografa a API key
-        $this->load->library('encryption');
-        if (!$encryptedKey) {
-            $this->writeLog('error', 'API key Pagou PIX não encontrada nas configurações.');
+        $apiToken = pagou_gateway_api_token('pagou_pix');
+        if (!$apiToken) {
+            $this->writeLog('error', 'API key Pagou PIX não configurada.');
             echo json_encode(['status' => 'error', 'message' => 'Configuração de API key PIX ausente.']);
             return;
         }
-        $apiToken = $this->encryption->decrypt($encryptedKey);
-        if (!$apiToken) {
-            $this->writeLog('error', 'Falha ao descriptografar a API key Pagou PIX.');
-            echo json_encode(['status' => 'error', 'message' => 'API key PIX inválida ou não configurada.']);
+        $api_base = pagou_gateway_api_base_url('pagou_pix');
+        $resource_url = $api_base . '/v1/pix/' . rawurlencode($transaction_id_to_use);
+
+        // Confere na API: só cobrança paga (status 4) e sem solicitação de estorno registrada
+        $current = $this->pagouRequest('GET', $resource_url, $apiToken);
+        if ($current['http_code'] !== 200 || !is_array($current['body'])) {
+            echo json_encode(['status' => 'error', 'message' => 'Não foi possível consultar a cobrança na Pagou. Tente novamente em instantes.']);
             return;
         }
-        $this->writeLog('debug', "API Token PIX descriptografado: " . substr($apiToken, 0, 4) . '...');
+        // refund.status: 1 registro vazio, 2 pendente, 3 confirmada
+        $refund = $current['body']['refund'] ?? null;
+        $refund_status = is_array($refund) ? (int) ($refund['status'] ?? 0) : 0;
+        $charge_status = (int) ($current['body']['status'] ?? 0);
 
-        // Registra a solicitação de reembolso no log da transação
+        if ($refund_status === 3 || $charge_status === 5) {
+            $refunded_amount = is_array($refund) && isset($refund['amount']) ? (float) $refund['amount'] : (float) $transaction->amount_final;
+            $full = $refunded_amount + 0.009 >= (float) $transaction->amount_final;
+            $this->pagou_model->update_transaction_pix_status($transaction_id_to_use, $full ? 'refunded' : 'partially_refunded', []);
+            echo json_encode(['status' => 'warning', 'message' => 'A Pagou já registra a devolução desta cobrança. O status local foi atualizado.']);
+            return;
+        }
+        if ($refund_status === 2) {
+            $this->pagou_model->update_transaction_pix_status($transaction_id_to_use, 'refund_requested', []);
+            echo json_encode(['status' => 'warning', 'message' => 'Já existe uma devolução pendente na Pagou para esta cobrança. Aguarde a confirmação.']);
+            return;
+        }
+        if ($charge_status !== 4) {
+            echo json_encode(['status' => 'error', 'message' => 'A cobrança não está paga na Pagou e não pode ser estornada.']);
+            return;
+        }
+        if ($transaction->status === 'refund_requested') {
+            // Sem devolução registrada na Pagou: a solicitação anterior não foi efetivada
+            $this->pagou_model->update_transaction_pix_status($transaction_id_to_use, 'paid', []);
+        }
+
+        $payload_refund = [
+            'amount'      => $refund_amount,
+            'reason'      => $reason,
+            'description' => mb_substr($description, 0, 255),
+        ];
+
         $this->pagou_model->add_refund_log($transaction_id_to_use, [
             'action' => 'refund_requested',
             'amount' => $refund_amount,
@@ -283,367 +305,116 @@ class Pagou extends AdminController
             'staff_name' => get_staff_full_name(get_staff_user_id())
         ]);
 
-        // Faz requisição DELETE para reembolso
-        $this->writeLog('info', 'Iniciando requisição DELETE para reembolso na API Pagou PIX.');
-        $ch = curl_init($api_url);
-        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "DELETE");
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload_refund));
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'Content-Type: application/json',
-            "X-API-KEY: {$apiToken}"
-        ]);
+        $result = $this->pagouRequest('DELETE', $resource_url . '/refund', $apiToken, $payload_refund);
+        $http_code = $result['http_code'];
 
-        $response_raw = curl_exec($ch);
-        $http_code    = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $error_msg    = curl_error($ch);
-        curl_close($ch);
-
-        $this->writeLog('debug', "Resposta bruta da API PIX: {$response_raw}");
-        $this->writeLog('debug', "HTTP Code: {$http_code} - cURL Error: {$error_msg}");
-
-        // Analisa a resposta
-        if ($http_code === 200 || $http_code === 201 || $http_code === 204) {
-            $this->writeLog('info', "Reembolso PIX aprovado pela API para transaction_id: {$transaction_id}. Atualizando status localmente.");
-
-            // Define dados adicionais para atualização
-            $additional_data = [
-                'data_estorno' => date('Y-m-d H:i:s'),
-                'webhook_log' => json_encode([
-                    'refund_amount' => $refund_amount,
-                    'refund_description' => $description,
-                    'refund_reason' => $reason,
-                    'refund_date' => date('Y-m-d H:i:s'),
-                    'http_code' => $http_code,
-                    'response' => $response_raw
-                ])
-            ];
-
-            // Atualiza status da transação para 'refunded'
-            $update_result = $this->pagou_model->update_transaction_pix_status(
-                $transaction_id_to_use, 
-                'refunded',
-                $additional_data
-            );
-            
-            // Verifica se a atualização foi bem-sucedida
-            if (!$update_result) {
-                $this->writeLog('error', "Falha ao atualizar status da transação PIX para 'refunded'");
-                
-                // Registra o erro no log de reembolso
-                $this->pagou_model->add_refund_log($transaction_id_to_use, [
-                    'action' => 'update_status_failed',
-                    'details' => 'Reembolso aprovado pela API, mas falha ao atualizar status local'
-                ]);
-                
-                echo json_encode([
-                    'status' => 'warning', 
-                    'message' => 'Reembolso processado pela Pagou, mas houve um erro ao atualizar o status interno. Por favor, atualize a página.'
-                ]);
-                return;
-            }
-            
-            $this->writeLog('info', "Status da transação PIX {$transaction_id} atualizado para 'refunded'.");
-
-            // Registra o sucesso no log de reembolso
+        if ($http_code === 204 || $http_code === 200) {
+            // 204 indica apenas que a solicitação foi aceita; a conclusão vem pelo qrcode.refunded
+            $this->pagou_model->update_transaction_pix_status($transaction_id_to_use, 'refund_requested', []);
             $this->pagou_model->add_refund_log($transaction_id_to_use, [
-                'action' => 'refund_success',
+                'action' => 'refund_accepted',
                 'amount' => $refund_amount,
                 'http_code' => $http_code,
-                'api_response' => $response_raw
             ]);
 
-            // Atualiza a fatura -> status=5 (Cancelado)
-            $this->db->where('id', $transaction->invoice_id);
-            $this->db->update(db_prefix() . 'invoices', ['status' => 5]);
-            $this->writeLog('info', "Fatura ID {$transaction->invoice_id} atualizada para status=5 (Cancelado).");
+            $this->writeActivity("Estorno PIX solicitado para a transação {$transaction_id} no valor de R$ " .
+                                number_format($refund_amount, 2, ',', '.') .
+                                " | Fatura: #{$transaction->invoice_prefix}{$transaction->invoice_number}");
 
-            // Registra a atividade de reembolso no sistema
-            $this->writeActivity("Reembolso PIX realizado para a transação {$transaction_id} no valor de R$ " . 
-                                number_format($refund_amount, 2, ',', '.') . 
-                                " | Cliente: {$transaction->client_company} | Fatura: #{$transaction->invoice_prefix}{$transaction->invoice_number}");
-
+            $has_split = (new Pagou_split())->on_reversal('pix', $transaction_id_to_use, $transaction->invoice_id);
             echo json_encode([
-                'status' => 'success', 
-                'message' => 'Reembolso PIX realizado com sucesso!',
+                'status' => 'success',
+                'message' => 'Estorno solicitado à Pagou. A fatura será atualizada quando a devolução for confirmada.'
+                    . ($has_split ? ' Esta cobrança tem split: a devolução depende da recuperação dos repasses.' : ''),
                 'transaction' => [
                     'id' => $transaction_id,
                     'refund_amount' => $refund_amount,
                     'refund_date' => date('d/m/Y H:i:s')
                 ]
             ]);
-        } else {
-            // Falha ao reembolsar
-            $this->writeLog('error', "Erro ao realizar o reembolso PIX para transação ID: {$transaction_id}. HTTP CODE: {$http_code}, Erro cURL: {$error_msg}, Resposta API: {$response_raw}");
-            
-            // Extrai e traduz mensagem de erro
-            $error_message = 'Erro ao realizar reembolso PIX.';
-            $api_error = '';
-            
-            // Tenta extrair mensagem de erro da resposta
-            if (!empty($response_raw)) {
-                $response_data = json_decode($response_raw, true);
-                if (isset($response_data['error'])) {
-                    $api_error = $response_data['error'];
-                    $error_message .= ' ' . $this->translateApiError($api_error);
-                } elseif (isset($response_data['errors']) && is_array($response_data['errors'])) {
-                    $api_error = implode(', ', $response_data['errors']);
-                    $error_message .= ' ' . $this->translateApiError($api_error);
-                }
-            }
-            
-            // Registra falha no log de reembolso
-            $this->pagou_model->add_refund_log($transaction_id_to_use, [
-                'action' => 'refund_failed',
-                'amount' => $refund_amount,
-                'http_code' => $http_code,
-                'api_error' => $api_error,
-                'error_details' => $error_msg ?: $response_raw
-            ]);
-            
-            echo json_encode(['status' => 'error', 'message' => $error_message]);
-        }
-
-        $this->writeLog('info', 'Finalizando método reembolso_ajax.');
-    }
-
-    /**
-     * Endpoint para processar webhooks recebidos da API Pagou.
-     *
-     * @return void
-     */
-    public function webhook()
-    {
-        // Log de acesso ao webhook
-        $this->writeLog('debug', 'Webhook endpoint accessed');
-        $this->writeLog('debug', 'Request method: ' . $_SERVER['REQUEST_METHOD']);
-        $this->writeLog('debug', 'Headers: ' . json_encode(getallheaders()));
-
-        // Desativa proteção CSRF
-        $this->config->set_item('csrf_protection', FALSE);
-        
-        // Obtenção do payload bruto
-        $payload = file_get_contents('php://input');
-        $this->writeLog('debug', 'Raw payload received: ' . $payload);
-
-        if (empty($payload)) {
-            $this->writeLog('error', 'Payload is empty');
-            $this->output
-                ->set_status_header(400)
-                ->set_content_type('application/json')
-                ->set_output(json_encode(['error' => 'Empty payload']))
-                ->_display();
-            exit;
-        }
-
-        // Verifica se o método é POST
-        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-            $this->writeLog('error', 'Invalid HTTP method: ' . $_SERVER['REQUEST_METHOD']);
-            $this->output
-                ->set_status_header(405)
-                ->set_header('Allow: POST')
-                ->set_content_type('application/json')
-                ->set_output(json_encode(['error' => 'Method Not Allowed']))
-                ->_display();
-            exit;
-        }
-
-        // Decodifica o payload JSON
-        $data = json_decode($payload);
-        if (!$data) {
-            $this->writeLog('error', 'Invalid JSON payload');
-            $this->output
-                ->set_status_header(400)
-                ->set_content_type('application/json')
-                ->set_output(json_encode(['error' => 'Invalid JSON']))
-                ->_display();
-            exit;
-        }
-        $this->writeLog('debug', 'Decoded JSON payload: ' . json_encode($data));
-
-        // Determina o tipo de pagamento com base no evento
-        $event_name = isset($data->name) ? $data->name : '';
-        $payment_type = (strpos($event_name, 'qrcode') !== false) ? 'pix' : 'boleto';
-        
-        $this->writeLog('info', "Tipo de pagamento determinado: {$payment_type}, Evento: {$event_name}");
-        
-        // Processa o webhook usando a classe apropriada
-        if ($payment_type == 'pix') {
-            // Para eventos de PIX
-            require_once(APPPATH . 'controllers/Pagou_webhook.php');
-            $webhook_handler = new Pagou_webhook();
-            $webhook_handler->process();
-        } else {
-            // Para eventos de Boleto
-            require_once(APPPATH . 'libraries/pagou/Webhook_handler.php');
-            $webhook_handler = new Webhook_handler();
-            $webhook_handler->processWebhook();
-        }
-        
-        // Resposta de sucesso como fallback (não deve chegar aqui normalmente)
-        $this->output
-            ->set_status_header(200)
-            ->set_content_type('application/json')
-            ->set_output(json_encode(['message' => 'Webhook processed']))
-            ->_display();
-        exit;
-    }
-
-    /**
-     * Verifica o status do pagamento com base no hash fornecido.
-     *
-     * @param string $hash Hash único da fatura.
-     * @return void
-     */
-    public function check_payment($hash)
-    {
-        $this->writeLog('debug', 'Check payment called with hash: ' . $hash);
-        $this->db->where('hash', $hash);
-        $invoice = $this->db->get('tblinvoices')->row();
-
-        if (!$invoice) {
-            $this->writeLog('error', 'Invoice not found for hash: ' . $hash);
-            echo json_encode(['status' => 'not_found']);
             return;
         }
 
-        $this->writeLog('debug', 'Invoice found: ' . json_encode($invoice));
-        
-        // Verifica pagamento PIX primeiro
-        $this->db->where('invoice_id', $invoice->id);
-        $this->db->order_by('date_created', 'DESC');
-        $transaction_pix = $this->db->get('pagou_transactions_pix')->row();
-        
-        // Verifica pagamento Boleto se não encontrou PIX
-        if (!$transaction_pix) {
-            $this->db->where('invoice_id', $invoice->id);
-            $this->db->order_by('date_created', 'DESC');
-            $transaction_boleto = $this->db->get('pagou_transactions_boleto')->row();
-            
-            if ($transaction_boleto && $transaction_boleto->status === 'paid') {
-                $this->writeLog('debug', 'Boleto paid for invoice ID: ' . $invoice->id);
-                echo json_encode(['status' => 'paid']);
-            } else {
-                $this->writeLog('debug', 'Transaction pending for invoice ID: ' . $invoice->id);
-                echo json_encode(['status' => 'pending']);
-            }
-        } else {
-            if ($transaction_pix->status === 'paid') {
-                $this->writeLog('debug', 'PIX paid for invoice ID: ' . $invoice->id);
-                echo json_encode(['status' => 'paid']);
-            } else {
-                $this->writeLog('debug', 'Transaction pending for invoice ID: ' . $invoice->id);
-                echo json_encode(['status' => 'pending']);
+        $uncertain = ($http_code === 0 || $http_code >= 500 || $http_code === 409);
+        $api_error = '';
+        if (is_array($result['body'])) {
+            $api_error = $result['body']['error'] ?? $result['body']['message'] ?? '';
+            if (is_array($api_error)) {
+                $api_error = implode(', ', $api_error);
             }
         }
+
+        $this->pagou_model->add_refund_log($transaction_id_to_use, [
+            'action' => $uncertain ? 'refund_uncertain' : 'refund_failed',
+            'amount' => $refund_amount,
+            'http_code' => $http_code,
+            'api_error' => $api_error,
+        ]);
+
+        if ($uncertain) {
+            // Resultado indeterminado: não repetir sem conferir a cobrança
+            $this->pagou_model->update_transaction_pix_status($transaction_id_to_use, 'refund_requested', []);
+            echo json_encode(['status' => 'warning', 'message' => 'A Pagou não confirmou o recebimento da solicitação. Não repita o estorno: confira a cobrança no painel da Pagou antes.']);
+            return;
+        }
+
+        if (Pagou_split::is_api_split_error($api_error) || ($http_code === 400 && (new Pagou_split())->has_split('pix', $transaction_id_to_use))) {
+            echo json_encode(['status' => 'error', 'message' => 'A Pagou recusou a devolução. A cobrança tem split: confira o saldo e as restrições dos recebedores. Detalhe: ' . $api_error]);
+            return;
+        }
+        echo json_encode(['status' => 'error', 'message' => 'Erro ao solicitar estorno PIX. ' . $this->translateApiError($api_error)]);
     }
 
     /**
-     * Obtém o status do pagamento com base no ID da transação.
+     * Requisição à API Pagou com timeout e sem seguir redirecionamentos.
      *
-     * @param string $transaction_id ID da transação.
-     * @param string $payment_type Tipo de pagamento (pix ou boleto).
-     * @return void
+     * @param string     $method
+     * @param string     $url
+     * @param string     $api_token
+     * @param array|null $body
+     * @return array ['http_code' => int, 'body' => array|null]
      */
-    public function get_payment_status($transaction_id, $payment_type = 'pix')
+    private function pagouRequest($method, $url, $api_token, $body = null)
     {
-        if ($payment_type === 'pix') {
-            $status = $this->pagou_model->get_transaction_pix_status($transaction_id);
-        } else {
-            $status = $this->pagou_model->get_transaction_boleto_status($transaction_id);
-        }
-        
-        $this->writeLog('debug', "Payment status for {$payment_type} transaction_id {$transaction_id}: {$status}");
-        echo json_encode(['status' => $status]);
-    }
-
-    /**
-     * Verifica o status do pagamento para atualização da página
-     * 
-     * @param int $invoice_id ID da fatura
-     * @return void
-     */
-    public function check_payment_status($invoice_id) {
-        // Define o tipo de conteúdo como JSON
-        header('Content-Type: application/json');
-        
-        // Verifica se é uma requisição AJAX
-        if (!$this->input->is_ajax_request()) {
-            echo json_encode(['status' => 'error', 'message' => 'Acesso negado']);
-            return;
-        }
-        
-        // Verifica se há algum registro na tabela de atualizações
-        $this->db->where('invoice_id', $invoice_id);
-        $this->db->where('processed', 0);
-        $this->db->where('timestamp >', time() - 300); // Últimos 5 minutos
-        $refresh = $this->db->get(db_prefix() . 'sessions_pagou_refresh')->row();
-        
-        if ($refresh) {
-            // Marca como processado
-            $this->db->where('id', $refresh->id);
-            $this->db->update(db_prefix() . 'sessions_pagou_refresh', ['processed' => 1]);
-            
-            echo json_encode(['status' => 'paid']);
-            return;
-        }
-        
-        // Verifica o status da fatura diretamente
-        $invoice = $this->db->select('status')
-            ->where('id', $invoice_id)
-            ->get('tblinvoices')
-            ->row();
-        
-        if ($invoice && $invoice->status == 2) {
-            echo json_encode(['status' => 'paid']);
-        } else {
-            echo json_encode(['status' => 'pending']);
-        }
-    }
-    
-    /**
-     * Exibe a página de configurações do Pagou
-     */
-    public function pagou_conf()
-    {
-        $this->writeLog('info', 'Acessando página de configurações do Pagou');
-        
-        // Verifica permissões
-        if (!has_permission('pagou', '', 'view')) {
-            access_denied('Pagou Configurações');
-        }
-        
-        // Processa o formulário de configuração se enviado
-        if ($this->input->post()) {
-            $post_data = $this->input->post();
-            
-            // Atualiza as configurações
-            update_option('pagou_logs_api', isset($post_data['pagou_logs_api']) ? 1 : 0);
-            
-            // Opções adicionais que podem ser configuradas
-            if (isset($post_data['pagou_webhook_url'])) {
-                update_option('pagou_webhook_url', $post_data['pagou_webhook_url']);
-            }
-            
-            set_alert('success', 'Configurações atualizadas com sucesso');
-            redirect(admin_url('pagou/pagou_conf'));
-        }
-        
-        // Carrega as configurações para exibição
-        $data = [
-            'title' => 'Configurações do Pagou',
-            'pagou_logs_api' => get_option('pagou_logs_api'),
-            'pagou_webhook_url' => get_option('pagou_webhook_url')
+        $ch = curl_init($url);
+        $headers = [
+            'Accept: application/json',
+            'User-Agent: pagou-perfex/2.0.0',
+            'X-API-KEY: ' . $api_token,
         ];
-        
-        $this->load->view('admin/pagou/config', $data);
+        if ($body !== null) {
+            $headers[] = 'Content-Type: application/json';
+            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body));
+        }
+        curl_setopt_array($ch, [
+            CURLOPT_CUSTOMREQUEST  => $method,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER     => $headers,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_TIMEOUT        => 30,
+            CURLOPT_FOLLOWLOCATION => false,
+        ]);
+        $response = curl_exec($ch);
+        $http_code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        return [
+            'http_code' => $http_code,
+            'body' => ($response !== false && $response !== '') ? json_decode($response, true) : null,
+        ];
     }
-    
+
     /**
      * Ajax handler para dados de transações PIX
      */
     public function get_pix_transactions()
     {
+        if (!staff_can('access_reembolso', 'pagou_module')) {
+            header('Content-Type: application/json');
+            echo json_encode(['status' => 'error', 'message' => 'Sem permissão para esta ação.']);
+            return;
+        }
+
         $this->writeLog('debug', 'Buscando transações PIX para DataTables');
         
         // Verifica se é uma requisição AJAX
@@ -678,15 +449,17 @@ class Pagou extends AdminController
                 $invoice_number = '#' . $transaction->invoice_id;
             }
             
+            $esc = function ($v) { return htmlspecialchars((string) $v, ENT_QUOTES, 'UTF-8'); };
+
             // Link da invoice
-            $invoice_link = admin_url('invoices/list_invoices/' . $transaction->invoice_id);
-            $invoice_html = '<a href="' . $invoice_link . '" target="_blank">' . $invoice_number . '</a>';
-            
+            $invoice_link = admin_url('invoices/list_invoices/' . (int) $transaction->invoice_id);
+            $invoice_html = '<a href="' . $esc($invoice_link) . '" target="_blank">' . $esc($invoice_number) . '</a>';
+
             // Cliente e link
             $client_name = isset($transaction->client_company) ? $transaction->client_company : '---';
-            $client_link = admin_url('clients/client/' . ($transaction->clientid ?? '0'));
-            $client_html = '<a href="' . $client_link . '" target="_blank">' . htmlspecialchars($client_name, ENT_QUOTES) . '</a>';
-            
+            $client_link = admin_url('clients/client/' . (int) ($transaction->clientid ?? 0));
+            $client_html = '<a href="' . $esc($client_link) . '" target="_blank">' . $esc($client_name) . '</a>';
+
             // Valor formatado
             $valor_formatado = number_format(
                 isset($transaction->amount_final) ? $transaction->amount_final : 0, 
@@ -698,14 +471,22 @@ class Pagou extends AdminController
             $status_class = '';
             $status_icon = '';
             
-            if ($status_db === 'paid' || $status_db === '3') {
+            if ($status_db === 'paid' || $status_db === '4') {
                 $status_display = 'Pago';
                 $status_class = 'success';
                 $status_icon = 'fa-check-circle';
-            } elseif ($status_db === 'pending' || $status_db === '2') {
+            } elseif (in_array($status_db, ['pending', 'active', '1', '2'], true)) {
                 $status_display = 'Pendente';
                 $status_class = 'warning';
                 $status_icon = 'fa-clock-o';
+            } elseif ($status_db === 'refund_requested') {
+                $status_display = 'Estorno solicitado';
+                $status_class = 'info';
+                $status_icon = 'fa-hourglass-half';
+            } elseif ($status_db === 'partially_refunded') {
+                $status_display = 'Reembolso parcial';
+                $status_class = 'warning';
+                $status_icon = 'fa-undo';
             } elseif ($status_db === 'refunded') {
                 $status_display = 'Reembolsado';
                 $status_class = 'danger';
@@ -716,7 +497,7 @@ class Pagou extends AdminController
                 $status_icon = 'fa-question-circle';
             }
             
-            $status_html = '<span class="label label-' . $status_class . '"><i class="fa ' . $status_icon . '"></i> ' . $status_display . '</span>';
+            $status_html = '<span class="label label-' . $status_class . '"><i class="fa ' . $status_icon . '"></i> ' . $esc($status_display) . '</span>';
             
             // Método de pagamento
             $payment_method = isset($transaction->payment_method) ? $transaction->payment_method : '';
@@ -727,7 +508,7 @@ class Pagou extends AdminController
             } elseif ($payment_method == 'boleto') {
                 $method_display = '<span class="label label-default"><i class="fa fa-barcode"></i> Boleto</span>';
             } else {
-                $method_display = '<span class="label label-default">' . ucfirst($payment_method) . '</span>';
+                $method_display = '<span class="label label-default">' . $esc(ucfirst($payment_method)) . '</span>';
             }
             
             // ID da Transação
@@ -738,49 +519,34 @@ class Pagou extends AdminController
                 $transaction->transaction_id : 
                 '';
                 
-            $transaction_id_html = '<span class="transaction-id" title="' . $transaction_id_full . '" data-toggle="tooltip">' . $transaction_id_display . '</span>';
+            $transaction_id_html = '<span class="transaction-id" title="' . $esc($transaction_id_full) . '" data-toggle="tooltip">' . $esc($transaction_id_display) . '</span>';
+
+            $details_button = '<button class="btn btn-info btn-sm" data-transaction="' . $esc($transaction->transaction_id) . '" onclick="viewTransactionDetails(this.dataset.transaction)"><i class="fa fa-eye"></i></button>';
             
             // Data Pagamento
             $data_pagamento = !empty($transaction->data_pagamento) ? _dt($transaction->data_pagamento) : '---';
             
             // Botão de ação
-            $action_html = '';
-            if (($status_db === 'paid' || $status_db === '3') && ($payment_method === 'pix')) {
-                $action_html = '<div class="btn-group">
-                    <button class="btn btn-success btn-sm" onclick="refundTransaction(\'' . 
-                    $transaction->transaction_id . '\', \'' . 
-                    addslashes($client_name) . '\', \'' . 
-                    $invoice_number . '\', ' . 
-                    (isset($transaction->amount_final) ? $transaction->amount_final : 0) . 
-                    ')"><i class="fa fa-undo"></i> Reembolsar</button>
-                    <button class="btn btn-info btn-sm" onclick="viewTransactionDetails(\'' .
-                    $transaction->transaction_id . '\')"><i class="fa fa-eye"></i></button>
-                </div>';
-            } elseif ($status_db === 'refunded') {
+            if (in_array($status_db, ['paid', '4', 'refund_requested'], true) && ($payment_method === 'pix') && empty($transaction->boleto_transaction_id)) {
+                $action_html = '<div class="btn-group">'
+                    . '<button class="btn btn-success btn-sm"'
+                    . ' data-transaction="' . $esc($transaction->transaction_id) . '"'
+                    . ' data-client="' . $esc($client_name) . '"'
+                    . ' data-invoice="' . $esc($invoice_number) . '"'
+                    . ' data-amount="' . $esc((float) ($transaction->amount_final ?? 0)) . '"'
+                    . ' onclick="refundTransaction(this.dataset.transaction, this.dataset.client, this.dataset.invoice, parseFloat(this.dataset.amount))">'
+                    . '<i class="fa fa-undo"></i> Reembolsar</button>'
+                    . $details_button . '</div>';
+            } elseif (in_array($status_db, ['refunded', 'partially_refunded'], true)) {
                 $data_estorno = !empty($transaction->data_estorno) ? _dt($transaction->data_estorno) : '';
-                $action_html = '<div class="btn-group">
-                    <span class="label label-danger"><i class="fa fa-undo"></i> Reembolsado';
-                if ($data_estorno) {
-                    $action_html .= '<br>em ' . $data_estorno;
-                }
-                $action_html .= '</span>
-                    <button class="btn btn-info btn-sm" onclick="viewTransactionDetails(\'' .
-                    $transaction->transaction_id . '\')"><i class="fa fa-eye"></i></button>
-                </div>';
+                $label = $status_db === 'refunded' ? 'Reembolsado' : 'Reembolso parcial';
+                $action_html = '<div class="btn-group"><span class="label label-danger"><i class="fa fa-undo"></i> ' . $label
+                    . ($data_estorno ? '<br>em ' . $esc($data_estorno) : '') . '</span>' . $details_button . '</div>';
             } else {
-                $action_html = '<div class="btn-group">
-                    <span class="text-muted">';
-                if ($payment_method !== 'pix') {
-                    $action_html .= 'Não Elegível';
-                } else {
-                    $action_html .= 'Não Pago';
-                }
-                $action_html .= '</span>
-                    <button class="btn btn-info btn-sm" onclick="viewTransactionDetails(\'' .
-                    $transaction->transaction_id . '\')"><i class="fa fa-eye"></i></button>
-                </div>';
+                $label = !empty($transaction->boleto_transaction_id) ? 'Pix do boleto' : ($payment_method !== 'pix' ? 'Não Elegível' : 'Não Pago');
+                $action_html = '<div class="btn-group"><span class="text-muted">' . $label . '</span>' . $details_button . '</div>';
             }
-            
+
             // Adiciona linha de dados
             $row = [
                 $data_criacao,
@@ -812,6 +578,12 @@ class Pagou extends AdminController
      * @return void
      */
     public function get_transaction_details() {
+        if (!staff_can('access_reembolso', 'pagou_module')) {
+            header('Content-Type: application/json');
+            echo json_encode(['status' => 'error', 'message' => 'Sem permissão para esta ação.']);
+            return;
+        }
+
         // Verifica se é uma requisição AJAX
         if (!$this->input->is_ajax_request()) {
             show_404();
@@ -834,26 +606,26 @@ class Pagou extends AdminController
         // Obtém histórico de reembolso
         $refund_history = $this->pagou_model->get_refund_history($transaction_id);
         
-        // Decodifica logs para exibição
+        // Logs exibidos sem dados pessoais
         $webhook_logs = [];
         if (!empty($transaction->webhook_log)) {
-            // Tenta decodificar como JSON
             $json_log = json_decode($transaction->webhook_log, true);
-            if (is_array($json_log)) {
-                $webhook_logs[] = $json_log;
-            } else {
-                // Se não for JSON, trata como string com quebras de linha
-                $logs = explode("\n---\n", $transaction->webhook_log);
-                foreach ($logs as $log) {
-                    $webhook_logs[] = $log;
-                }
+            $entries = is_array($json_log) ? [$json_log] : explode("\n---\n", $transaction->webhook_log);
+            foreach ($entries as $entry) {
+                $decoded = is_array($entry) ? $entry : json_decode((string) $entry, true);
+                $webhook_logs[] = is_array($decoded) ? pagou_redact($decoded) : '[registro textual omitido]';
             }
         }
-        
+        $public = (array) $transaction;
+        foreach (['api_request', 'api_response', 'webhook_log', 'reembolso_log', 'qr_code', 'qr_code_text'] as $field) {
+            unset($public[$field]);
+        }
+        $transaction_public = pagou_redact($public);
+
         // Prepara resposta
         $response = [
             'status' => 'success',
-            'transaction' => $transaction,
+            'transaction' => $transaction_public,
             'refund_history' => $refund_history,
             'webhook_logs' => $webhook_logs,
             'formatted' => [

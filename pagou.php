@@ -3,8 +3,8 @@ defined('BASEPATH') or exit('No direct script access allowed');
 
 /*
 Module Name: Pagou Integração Perfex CRM
-Description: Gateway de pagamento www.pagou.com.br, PIX & Boleto para Perfex CRM
-Version: 1.2.0
+Description: Gateway de pagamento www.pagou.com.br: PIX, Boleto e Cartão de Crédito para Perfex CRM
+Version: 2.2.0
 Requires at least: 3.2.0
 Author: Liquida SP
 Author URI: https://liquidasp.com.br/
@@ -28,33 +28,43 @@ function pagou_module_permissions()
     $permissions['capabilities'] = [
         'access_pix_avulso' => 'Acessar PIX Avulso',
         'access_reembolso'  => 'Acessar Reembolso de Pagamentos',
+        'card_reverse'      => 'Estornar cobranças de cartão',
+        'manage_split'      => 'Configurar split de pagamento',
     ];
 
     register_staff_capabilities('pagou_module', $permissions, _l('Pagou Integração'));
 }
 
 
-if ($CI->uri->segment(1) === 'pagou' && $CI->uri->segment(2) === 'webhook') {
-    require_once __DIR__ . '/controllers/Pagou.php';
-    $pagou = new Pagou();
-    $pagou->webhook();
-    exit;
-}
+// Webhooks não carregam token CSRF; a autenticação é feita pela assinatura HMAC
+hooks()->add_filter('csrf_exclude_uris', function ($uris) {
+    return array_merge((array) $uris, [
+        'admin/pagou/pagou_webhook/process.*',
+        'pagou/pagou_webhook/process.*',
+        'pagou/notification',
+        'pagou/webhook',
+    ]);
+});
 
 
 register_activation_hook('pagou', 'pagou_activation_hook');
 register_payment_gateway('pagou_boleto_gateway', 'pagou');
 register_payment_gateway('pagou_pix_gateway', 'pagou');
+register_payment_gateway('pagou_cartao_gateway', 'pagou');
 
 hooks()->add_action('invoice_marked_as_cancelled', 'cancel_pagou_boleto');
+hooks()->add_action('invoice_marked_as_cancelled', 'pagou_cancel_invoice_pix');
 hooks()->add_action('after_invoice_added', 'pagou_auto_issue_boleto');
 hooks()->add_action('after_invoice_updated', 'pagou_auto_issue_boleto_on_update');
 hooks()->add_action('after_cron_run', 'process_pagou_boleto_invoices');
+hooks()->add_action('after_cron_run', 'pagou_reconcile_payments');
 
 hooks()->add_action('admin_init', function () {
     $CI = &get_instance();
 
-    if (has_permission('pagou', '', 'view')) {
+    pagou_remember_api_tokens();
+
+    if (staff_can('access_pix_avulso', 'pagou_module') || staff_can('access_reembolso', 'pagou_module') || staff_can('card_reverse', 'pagou_module') || staff_can('manage_split', 'pagou_module')) {
         $CI->app_menu->add_sidebar_menu_item('pagou-menu', [
             'name' => 'Pagou',
             "icon" => "fa fa-usd",
@@ -76,6 +86,24 @@ hooks()->add_action('admin_init', function () {
                 'name' => 'Reembolso de Pagamentos',
                 'href' => admin_url('pagou/cobrancas_emitidas'),
                 'position' => 10,
+            ]);
+        }
+
+        if (staff_can('access_reembolso', 'pagou_module') || staff_can('card_reverse', 'pagou_module')) {
+            $CI->app_menu->add_sidebar_children_item('pagou-menu', [
+                'slug' => 'pagou-card-charges',
+                'name' => 'Cobranças de Cartão',
+                'href' => admin_url('pagou/card_admin'),
+                'position' => 15,
+            ]);
+        }
+
+        if (staff_can('manage_split', 'pagou_module')) {
+            $CI->app_menu->add_sidebar_children_item('pagou-menu', [
+                'slug' => 'pagou-split',
+                'name' => 'Split de Pagamento',
+                'href' => admin_url('pagou/split_admin'),
+                'position' => 20,
             ]);
         }
         
@@ -110,12 +138,7 @@ function pagou_adicionar_rotas()
     $conteudo = file_get_contents($file_path);
 
     $rotas = [
-        "\$route['pagou_gateway/make_payment/(:num)/(:any)'] = 'pagou_gateway/make_payment/\$1/\$2';",
-        "\$route['pagou_gateway/pay'] = 'pagou_gateway/pay';",
-        "\$route['pagou_gateway/callback'] = 'pagou_gateway/callback';",
-        "\$route['pagou/webhook'] = 'pagou/webhook';",
         "\$route['pagou/notification'] = 'notification/index';",
-        "\$route['pagou/check_payment/(:any)'] = 'pagou/check_payment/\$1';"
     ];
 
     $alterado = false;
@@ -145,124 +168,72 @@ function pagou_auto_issue_boleto($invoice_id)
 {
     $CI = &get_instance();
     $CI->load->model('invoices_model');
-    
     $invoice = $CI->invoices_model->get($invoice_id);
-    
-    if (!$invoice) {
-        log_activity('Pagou: Fatura ID ' . $invoice_id . ' não encontrada para emissão automática de boleto.');
+    if (!$invoice || !pagou_invoice_is_open($invoice)) {
         return false;
     }
-    
 
-    $allowed_payment_modes = [];
-    if (!empty($invoice->allowed_payment_modes)) {
-        $allowed_payment_modes = unserialize($invoice->allowed_payment_modes);
-    }
-    
-    if (!is_array($allowed_payment_modes)) {
-        log_activity('Pagou: Fatura ID ' . $invoice_id . ' - Modos de pagamento não definidos ou inválidos.');
+    $allowed = !empty($invoice->allowed_payment_modes) ? @unserialize($invoice->allowed_payment_modes) : [];
+    if (!is_array($allowed) || !in_array('pagou_boleto', $allowed, true)) {
         return false;
     }
-    
-    if (!in_array('pagou_boleto', $allowed_payment_modes)) {
-        return false;
-    }
-    
-    $CI->db->where('invoice_id', $invoice_id);
-    $existing_transaction = $CI->db->get(db_prefix() . 'pagou_transactions_boleto')->row();
-    
-    if ($existing_transaction) {
-        return pagou_update_boleto_info($existing_transaction);
-    }
-    
+
     try {
         require_once(__DIR__ . '/libraries/Pagou_boleto_gateway.php');
         $gateway = new Pagou_boleto_gateway();
-        
-        $data = ['invoice' => $invoice];
-        
-        $result = $gateway->process_payment($data);
-        
-        if ($result) {
-            log_activity('Pagou: Boleto gerado automaticamente para a fatura ID ' . $invoice_id);
-            return true;
-        } else {
-            log_activity('Pagou: Falha ao gerar boleto automaticamente para a fatura ID ' . $invoice_id);
-            return false;
-        }
-    } catch (Exception $e) {
+        // O gateway reaproveita, atualiza ou substitui o boleto existente conforme a consulta à API
+        $result = $gateway->process_payment(['invoice' => $invoice, 'auto_generated' => true]);
+        return pagou_flag_boleto_result($invoice_id, $result, false);
+    } catch (\Throwable $e) {
         log_activity('Pagou: Erro ao gerar boleto automaticamente: ' . $e->getMessage());
         return false;
     }
 }
 
+/**
+ * Grava em invoice_pagou o resultado da emissão automática:
+ * 1 = emitido ou indeterminado (não reemitir às cegas), 2 = recusado pela API (só no cron);
+ * 'later' (sem chave, banco não atualizado, trava ocupada) não grava nada.
+ */
+function pagou_flag_boleto_result($invoice_id, $result, $from_cron)
+{
+    $CI = &get_instance();
+    if ($result === 'later') {
+        return false;
+    }
+    if ($result === 'uncertain') {
+        log_activity('Pagou: emissão do boleto da fatura ID ' . $invoice_id . ' sem confirmação da API. Confira no painel da Pagou antes de emitir outro.');
+        $flag = 1;
+    } elseif ($result) {
+        $flag = 1;
+    } else {
+        if (!$from_cron) {
+            return false;
+        }
+        $flag = 2;
+    }
+    $CI->db->where('id', $invoice_id)->update(db_prefix() . 'invoices', ['invoice_pagou' => $flag]);
+
+    return $flag === 1 && $result !== 'uncertain';
+}
+
 
 function pagou_auto_issue_boleto_on_update($invoice_id)
 {
-    $CI = &get_instance();
-    
-    $CI->db->where('invoice_id', $invoice_id);
-    $existing = $CI->db->get(db_prefix() . 'pagou_transactions_boleto')->row();
-    
-    if (!$existing) {
-        return pagou_auto_issue_boleto($invoice_id);
-    }
-    
-    if (!in_array($existing->status, ['paid', 'confirmed'])) {
-        return pagou_update_boleto_info($existing);
-    }
-    
-    return false;
+    return pagou_auto_issue_boleto($invoice_id);
 }
 
 
 function pagou_update_boleto_info($transaction)
 {
-    $CI = &get_instance();
-    
     try {
-        require_once(__DIR__ . '/libraries/pagou/Api_client.php');
-        
-        $api_token = get_option('paymentmethod_pagou_boleto_api_token');
-        if (empty($api_token)) {
-            log_activity('Pagou: API Token não configurado.');
+        pagou_load_libraries();
+        if (!Pagou_schema::ready()) {
             return false;
         }
-        
-        $CI->load->library('encryption');
-        $api_token = $CI->encryption->decrypt($api_token);
-        
-        if (empty($api_token)) {
-            log_activity('Pagou: Não foi possível descriptografar o API Token.');
-            return false;
-        }
-        
-        $is_production = get_option('paymentmethod_pagou_boleto_is_production') === '1';
-        
-        $api_client = new Api_client($api_token, $is_production);
-        
-        $result = $api_client->getBoleto($transaction->transaction_id);
-        
-        if (!$result['success']) {
-            log_activity('Pagou: Falha ao consultar boleto na API: ' . $result['message']);
-            return false;
-        }
-        
-        $update_data = [
-            'status' => $result['data']->status ?? $transaction->status,
-            'updated_at' => date('Y-m-d H:i:s'),
-            'api_response' => json_encode($result['data'])
-        ];
-        
-        $CI->db->where('id', $transaction->id);
-        $CI->db->update(db_prefix() . 'pagou_transactions_boleto', $update_data);
-        
-        if (isset($result['data']->payload) && isset($result['data']->payload->qrcode_id)) {
-            pagou_save_pix_info_from_boleto($transaction->invoice_id, $result['data']);
-        }
-        
-        return true;
-    } catch (Exception $e) {
+        $events = new Pagou_events();
+        return $events->refresh_boleto($transaction) !== null;
+    } catch (\Throwable $e) {
         log_activity('Pagou: Erro ao atualizar informações do boleto: ' . $e->getMessage());
         return false;
     }
@@ -271,44 +242,9 @@ function pagou_update_boleto_info($transaction)
 
 function pagou_save_pix_info_from_boleto($invoice_id, $boleto_data)
 {
-    $CI = &get_instance();
-    
     try {
-        if (!isset($boleto_data->payload) || 
-            !isset($boleto_data->payload->qrcode_id) || 
-            !isset($boleto_data->payload->data)) {
-            return false;
-        }
-        
-        $CI->db->where('invoice_id', $invoice_id);
-        $existing_pix = $CI->db->get(db_prefix() . 'pagou_transactions_pix')->row();
-        
-        $pix_data = [
-            'invoice_id' => $invoice_id,
-            'transaction_id' => $boleto_data->payload->qrcode_id,
-            'cliente' => $boleto_data->payer->name ?? '',
-            'doc' => $boleto_data->payer->document ?? '',
-            'payment_method' => 'pix',
-            'qr_code' => $boleto_data->payload->image ?? '',
-            'qr_code_text' => $boleto_data->payload->data ?? '',
-            'amount' => $boleto_data->amount ?? 0,
-            'amount_final' => $boleto_data->amount ?? 0,
-            'status' => $boleto_data->status ?? 'pending',
-            'date_created' => date('Y-m-d H:i:s'),
-            'external_id' => $boleto_data->external_id ?? '',
-            'expiration_seconds' => 86400, // 24 horas
-            'api_response' => json_encode($boleto_data)
-        ];
-        
-        if ($existing_pix) {
-            $CI->db->where('id', $existing_pix->id);
-            $CI->db->update(db_prefix() . 'pagou_transactions_pix', $pix_data);
-        } else {
-            $CI->db->insert(db_prefix() . 'pagou_transactions_pix', $pix_data);
-        }
-        
-        return true;
-    } catch (Exception $e) {
+        return pagou_save_linked_pix($invoice_id, $boleto_data);
+    } catch (\Throwable $e) {
         log_activity('Pagou: Erro ao salvar informações de PIX do boleto: ' . $e->getMessage());
         return false;
     }
@@ -318,21 +254,87 @@ function process_pagou_boleto_invoices()
 {
     $CI = &get_instance();
 
+    // Só depois da atualização do banco (migration 200), que protege as faturas existentes
+    pagou_load_libraries();
+    if (!Pagou_schema::ready()) {
+        return;
+    }
+
+    // Só faturas abertas (1 não paga, 3 parcial, 4 vencida) ainda não processadas
     $CI->db->where("allowed_payment_modes LIKE '%\"pagou_boleto\"%' ");
     $CI->db->where("(invoice_pagou IS NULL OR invoice_pagou = 0)");
+    $CI->db->where_in('status', [1, 3, 4]);
+    // Lote pequeno por execução: cada emissão pode esperar a API
+    $CI->db->order_by('id', 'ASC')->limit(20);
     $invoices = $CI->db->get(db_prefix() . 'invoices')->result();
 
     if ($invoices) {
+        require_once(__DIR__ . '/libraries/Pagou_boleto_gateway.php');
         $gateway = new Pagou_boleto_gateway();
 
         foreach ($invoices as $invoice) {
-            $data = ['invoice' => $invoice];
-            $boleto_created = $gateway->process_payment($data);
+            $data = ['invoice' => $invoice, 'auto_generated' => true];
+            try {
+                $result = $gateway->process_payment($data);
+            } catch (\Throwable $e) {
+                log_activity('Pagou: erro na emissão automática do boleto da fatura ID ' . $invoice->id . ': ' . $e->getMessage());
+                $result = 'uncertain';
+            }
+            pagou_flag_boleto_result($invoice->id, $result, true);
+        }
+    }
+}
 
-            if ($boleto_created) {
-                $CI->db->where('id', $invoice->id);
-                $CI->db->update(db_prefix() . 'invoices', ['invoice_pagou' => 1]);
+
+/**
+ * Reconciliação pelo cron: dá baixa em cobranças pagas cujo webhook não chegou.
+ */
+function pagou_reconcile_payments()
+{
+    try {
+        pagou_load_libraries();
+        if (!Pagou_schema::ready()) {
+            return;
+        }
+        $events = new Pagou_events();
+        $events->reconcile();
+    } catch (\Throwable $e) {
+        log_activity('Pagou: erro na reconciliação de pagamentos: ' . $e->getMessage());
+    }
+}
+
+
+/**
+ * Fatura cancelada: cancela o Pix próprio ainda em aberto (DELETE /v1/pix/{id}).
+ * 204 só indica que o pedido foi aceito; se o Pix já tiver sido pago, a baixa segue pelo webhook.
+ */
+function pagou_cancel_invoice_pix($invoice_id)
+{
+    try {
+        pagou_load_libraries();
+        if (!Pagou_schema::ready()) {
+            return;
+        }
+        $api = Pagou_api::for_gateway('pagou_pix');
+        if (!$api) {
+            return;
+        }
+        $CI = &get_instance();
+        $table = db_prefix() . 'pagou_transactions_pix';
+        $rows = $CI->db->where('invoice_id', $invoice_id)
+            ->where('boleto_transaction_id IS NULL', null, false)
+            ->where_in('status', ['pending', 'active', '1', '2'])
+            ->get($table)->result();
+        foreach ($rows as $row) {
+            $response = $api->cancel_pix($row->transaction_id);
+            if ($response->http_code === 204) {
+                // Pedido aceito; a reconciliação acompanha até o estado final
+                $CI->db->where('id', $row->id)->update($table, ['status' => 'cancel_requested']);
+            } else {
+                log_activity('Pagou: não foi possível cancelar o Pix ' . $row->transaction_id . ' da fatura ID ' . $invoice_id . ' (HTTP ' . $response->http_code . ').');
             }
         }
+    } catch (\Throwable $e) {
+        log_activity('Pagou: erro ao cancelar o Pix da fatura: ' . $e->getMessage());
     }
 }

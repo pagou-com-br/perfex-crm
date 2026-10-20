@@ -90,7 +90,8 @@ $pix_table_structure = [
     'external_id' => 'varchar(255) DEFAULT NULL',
     'expiration_seconds' => 'int(11) DEFAULT 86400',
     'api_request' => 'text DEFAULT NULL',
-    'api_response' => 'text DEFAULT NULL'
+    'api_response' => 'text DEFAULT NULL',
+    'boleto_transaction_id' => 'varchar(255) DEFAULT NULL'
 ];
 
 // Criação ou atualização da tabela PIX
@@ -272,6 +273,10 @@ $invoice_column = 'invoice_pagou';
 if (!$CI->db->field_exists($invoice_column, $invoice_table)) {
     $CI->db->query("ALTER TABLE `$invoice_table` ADD COLUMN `$invoice_column` TINYINT(1) NOT NULL DEFAULT 0;");
 }
+
+// Esquema 2.0: eventos de webhook, colunas novas e proteção contra emissão em massa
+require_once __DIR__ . '/libraries/pagou/Pagou_schema.php';
+Pagou_schema::apply(false);
 
 /*
  * ============================

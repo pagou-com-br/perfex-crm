@@ -37,17 +37,34 @@ class Public_charge extends App_Controller {
             exit;
         }
         
-        // Se o formulário foi submetido com o CPF para desbloqueio...
+        // Limite de tentativas de CPF por cobrança, gravado no banco: 5 erros bloqueiam por 15 minutos
+        $table = db_prefix() . 'pix_avulso';
         if ($this->input->post('cpf_verify')) {
-            $cpf_input = $this->input->post('cpf_verify', true);
-            $cpf_input_clean = preg_replace('/\D/', '', $cpf_input);
-            $charge_cpf_clean = preg_replace('/\D/', '', $charge->cpf);
-            if ($cpf_input_clean !== $charge_cpf_clean) {
-                $data['error'] = _l('CPF inválido. Por favor, tente novamente.');
+            if (!empty($charge->cpf_locked_until) && strtotime($charge->cpf_locked_until) > time()) {
+                $data['error'] = _l('Muitas tentativas. Aguarde alguns minutos e tente de novo.');
                 $data['charge'] = $charge;
+                $data['unlocked'] = false;
                 $this->load->view('pagou/public_view_charge', $data);
                 return;
             }
+
+            $cpf_input_clean = preg_replace('/\D/', '', (string) $this->input->post('cpf_verify', true));
+            $charge_cpf_clean = preg_replace('/\D/', '', (string) $charge->cpf);
+            if (!hash_equals($charge_cpf_clean, $cpf_input_clean)) {
+                $attempts = (int) ($charge->cpf_attempts ?? 0) + 1;
+                $update = ['cpf_attempts' => $attempts >= 5 ? 0 : $attempts];
+                if ($attempts >= 5) {
+                    $update['cpf_locked_until'] = date('Y-m-d H:i:s', time() + 900);
+                }
+                $this->db->where('id', $charge->id)->update($table, $update);
+                $data['error'] = _l('CPF inválido. Por favor, tente novamente.');
+                $data['charge'] = $charge;
+                $data['unlocked'] = false;
+                $this->load->view('pagou/public_view_charge', $data);
+                return;
+            }
+            $this->db->where('id', $charge->id)->update($table, ['cpf_attempts' => 0, 'cpf_locked_until' => null]);
+            $data['unlocked'] = true;
         }
         $data['charge'] = $charge;
         $this->load->view('pagou/public_view_charge', $data);

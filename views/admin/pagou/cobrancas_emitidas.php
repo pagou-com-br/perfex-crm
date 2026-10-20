@@ -114,7 +114,7 @@ log_message('info', 'Carregando a view "Cobranças PIX Emitidas".');
                                         <?php 
                                         $pagos = 0;
                                         foreach ($transactions_pix as $trans) {
-                                            if ($trans->status == 'paid' || $trans->status == '2') {
+                                            if ($trans->status == 'paid' || $trans->status == '4') {
                                                 $pagos++;
                                             }
                                         }
@@ -635,11 +635,11 @@ function refundTransaction(transactionId, clientName, invoiceNumber, amount) {
         $('#btnConfirmarReembolso').html('<i class="fa fa-spinner fa-spin"></i> Processando...').prop('disabled', true);
         
         // Faz requisição DELETE via fetch para o endpoint de reembolso
-        let endpoint = admin_url + "pagou/reembolso_ajax?transaction_id=" + transactionId + "&payment_type=pix";
+        let endpoint = admin_url + "pagou/reembolso_ajax?transaction_id=" + encodeURIComponent(transactionId) + "&payment_type=pix";
         let payload = {
             amount: refundAmount,
             description: reasonText,
-            reason: 1  // reason fixo = 1 (conforme documentação da API)
+            reason: 3  // 3 = devolução solicitada pelo cliente final
         };
 
         fetch(endpoint, {
@@ -656,7 +656,7 @@ function refundTransaction(transactionId, clientName, invoiceNumber, amount) {
                 $('#modalReembolsoPix').modal('hide');
                 
                 // Exibe mensagem de sucesso
-                alert('Reembolso PIX realizado com sucesso!');
+                alert(data.message || 'Estorno solicitado à Pagou.');
                 
                 // Recarrega apenas a tabela DataTable
                 var table = $('.table-pix').DataTable();
@@ -725,14 +725,16 @@ function viewTransactionDetails(transactionId) {
                 var status = response.transaction.status;
                 var statusHtml = '';
                 
-                if (status === 'paid' || status === '2') {
+                if (status === 'paid' || status === '4') {
                     statusHtml = '<span class="label label-success"><i class="fa fa-check-circle"></i> Pago</span>';
                 } else if (status === 'pending' || status === '1') {
                     statusHtml = '<span class="label label-warning"><i class="fa fa-clock-o"></i> Pendente</span>';
+                } else if (status === 'refund_requested') {
+                    statusHtml = '<span class=\"label label-info\">Estorno solicitado</span>';
                 } else if (status === 'refunded') {
                     statusHtml = '<span class="label label-danger"><i class="fa fa-undo"></i> Reembolsado</span>';
                 } else {
-                    statusHtml = '<span class="label label-default">' + status + '</span>';
+                    statusHtml = $('<span class="label label-default"></span>').text(status).prop('outerHTML');
                 }
                 
                 $('#status_details').html(statusHtml);
@@ -747,6 +749,7 @@ function viewTransactionDetails(transactionId) {
                     $('#refundHistoryContent').show();
                     
                     var refundHtml = '';
+                    var esc = function (v) { return $('<span></span>').text(v === undefined || v === null ? '' : String(v)).html(); };
                     response.refund_history.forEach(function(log) {
                         var acaoLabel = '';
                         var detalhes = '';
@@ -755,18 +758,26 @@ function viewTransactionDetails(transactionId) {
                         switch(log.action) {
                             case 'refund_requested':
                                 acaoLabel = '<span class="label label-info">Solicitado</span>';
-                                detalhes = 'Motivo: ' + log.description;
+                                detalhes = 'Motivo: ' + esc(log.description);
                                 if (log.staff_name) {
-                                    detalhes += '<br>Por: ' + log.staff_name;
+                                    detalhes += '<br>Por: ' + esc(log.staff_name);
                                 }
                                 break;
                             case 'refund_success':
                                 acaoLabel = '<span class="label label-success">Aprovado</span>';
-                                detalhes = 'HTTP: ' + log.http_code;
+                                detalhes = 'HTTP: ' + esc(log.http_code);
                                 break;
                             case 'refund_failed':
                                 acaoLabel = '<span class="label label-danger">Falha</span>';
-                                detalhes = 'Erro: ' + log.api_error;
+                                detalhes = 'Erro: ' + esc(log.api_error);
+                                break;
+                            case 'refund_accepted':
+                                acaoLabel = '<span class="label label-success">Aceito pela Pagou</span>';
+                                detalhes = 'Aguardando confirmação da devolução';
+                                break;
+                            case 'refund_uncertain':
+                                acaoLabel = '<span class="label label-warning">Sem confirmação</span>';
+                                detalhes = 'Confira no painel da Pagou antes de repetir';
                                 break;
                             case 'refund_webhook':
                                 acaoLabel = '<span class="label label-primary">Webhook</span>';
@@ -774,17 +785,17 @@ function viewTransactionDetails(transactionId) {
                                 break;
                             case 'update_status_failed':
                                 acaoLabel = '<span class="label label-warning">Falha na Atualização</span>';
-                                detalhes = log.details || '';
+                                detalhes = esc(log.details || '');
                                 break;
                             default:
-                                acaoLabel = '<span class="label label-default">' + log.action + '</span>';
+                                acaoLabel = '<span class="label label-default">' + esc(log.action) + '</span>';
                         }
                         
                         // Formata valor
                         var valorFormatado = log.amount ? formatarMoeda(parseFloat(log.amount)) : '---';
                         
                         refundHtml += '<tr>' +
-                            '<td>' + (log.timestamp || '---') + '</td>' +
+                            '<td>' + esc(log.timestamp || '---') + '</td>' +
                             '<td>' + acaoLabel + '</td>' +
                             '<td>R$ ' + valorFormatado + '</td>' +
                             '<td>' + detalhes + '</td>' +
