@@ -1,6 +1,6 @@
 # Testes de integração
 
-Exercitam o processador de eventos (webhooks, reconciliação, migration 200) e os gateways Pix e Boleto contra um banco MariaDB real e um servidor simulado da API Pagou. Nenhuma chamada vai para a API real.
+Exercitam o processador de eventos (webhooks, reconciliação, migration 200) , os gateways Pix e Boleto, o cartão e o split contra um banco MariaDB real e um servidor simulado da API Pagou. Nenhuma chamada vai para a API real.
 
 ## Requisitos
 
@@ -14,7 +14,7 @@ Exercitam o processador de eventos (webhooks, reconciliação, migration 200) e 
 tests/integration/run.sh
 ```
 
-O script baixa o CodeIgniter 3.1.13 para `tests/integration/.ci3`, sobe o container `pagou-perfex-test-db` (MariaDB na porta 33071) e o mock da API em `127.0.0.1:8099`.
+O script baixa o CodeIgniter 3.1.13 para `tests/integration/.ci3`, sobe o container `pagou-perfex-test-db` (MariaDB na porta 33071) e o mock da API em `127.0.0.1:8098` (troque com `PAGOU_MOCK_PORT`).
 
 ## Limites
 
